@@ -195,6 +195,9 @@ fn get_ledger_changes(
             ScErrorCode::InternalError,
         ))
     };
+    // Scratch buffer for computing old entry sizes - reused across iterations
+    // to avoid repeated allocations. Only the length is needed, not the content.
+    let mut scratch_buf = Vec::with_capacity(1024);
     for (key, entry_with_live_until_ledger) in storage.map.iter(budget)? {
         let mut entry_change = LedgerEntryChange::default();
         metered_write_xdr(budget, key.as_ref(), &mut entry_change.encoded_key)?;
@@ -216,11 +219,11 @@ fn get_ledger_changes(
         }
         let entry_with_live_until = init_storage_snapshot.get(key)?;
         if let Some((old_entry, old_live_until_ledger)) = entry_with_live_until {
-            let mut buf = vec![];
-            metered_write_xdr(budget, old_entry.as_ref(), &mut buf)?;
+            scratch_buf.clear();
+            metered_write_xdr(budget, old_entry.as_ref(), &mut scratch_buf)?;
 
             entry_change.old_entry_size_bytes_for_rent =
-                entry_size_for_rent(budget, &old_entry, buf.len() as u32)?;
+                entry_size_for_rent(budget, &old_entry, scratch_buf.len() as u32)?;
 
             if let Some(ref mut ttl_change) = &mut entry_change.ttl_change {
                 ttl_change.old_live_until_ledger =
