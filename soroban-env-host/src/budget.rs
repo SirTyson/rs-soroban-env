@@ -222,49 +222,56 @@ impl BudgetImpl {
         iterations: u64,
         input: Option<u64>,
     ) -> Result<(), HostError> {
+        if self.is_in_shadow_mode {
+            self.charge_shadow(ty, iterations, input)
+        } else {
+            self.charge_direct(ty, iterations, input)
+        }
+    }
+
+    #[inline(always)]
+    fn charge_direct(
+        &mut self,
+        ty: ContractCostType,
+        iterations: u64,
+        input: Option<u64>,
+    ) -> Result<(), HostError> {
         let tracker = self
             .tracker
             .cost_trackers
             .get_mut(ty as usize)
             .ok_or_else(|| HostError::from((ScErrorType::Budget, ScErrorCode::InternalError)))?;
 
-        if !self.is_in_shadow_mode {
-            // update tracker for reporting
-            self.tracker.meter_count = self.tracker.meter_count.saturating_add(1);
-            tracker.iterations = tracker.iterations.saturating_add(iterations);
-            match (&mut tracker.inputs, input) {
-                (None, None) => (),
-                (Some(t), Some(i)) => *t = t.saturating_add(i.saturating_mul(iterations)),
-                // internal logic error, a wrong cost type has been passed in
-                _ => return Err((ScErrorType::Budget, ScErrorCode::InternalError).into()),
-            };
-        }
+        self.tracker.meter_count = self.tracker.meter_count.saturating_add(1);
+        tracker.iterations = tracker.iterations.saturating_add(iterations);
+        match (&mut tracker.inputs, input) {
+            (None, None) => (),
+            (Some(t), Some(i)) => *t = t.saturating_add(i.saturating_mul(iterations)),
+            _ => return Err((ScErrorType::Budget, ScErrorCode::InternalError).into()),
+        };
 
-        let cpu_charged = self.cpu_insns.charge(
-            ty,
-            iterations,
-            input,
-            IsCpu(true),
-            IsShadowMode(self.is_in_shadow_mode),
-        )?;
-        if !self.is_in_shadow_mode {
-            tracker.cpu = tracker.cpu.saturating_add(cpu_charged);
-        }
+        let cpu_charged = self.cpu_insns.charge_direct(ty, iterations, input)?;
+        tracker.cpu = tracker.cpu.saturating_add(cpu_charged);
+        self.cpu_insns.check_budget_limit_direct()?;
+
+        let mem_charged = self.mem_bytes.charge_direct(ty, iterations, input)?;
+        tracker.mem = tracker.mem.saturating_add(mem_charged);
+        self.mem_bytes.check_budget_limit_direct()
+    }
+
+    fn charge_shadow(
+        &mut self,
+        ty: ContractCostType,
+        iterations: u64,
+        input: Option<u64>,
+    ) -> Result<(), HostError> {
         self.cpu_insns
-            .check_budget_limit(IsShadowMode(self.is_in_shadow_mode))?;
+            .charge(ty, iterations, input, IsCpu(true), IsShadowMode(true))?;
+        self.cpu_insns.check_budget_limit(IsShadowMode(true))?;
 
-        let mem_charged = self.mem_bytes.charge(
-            ty,
-            iterations,
-            input,
-            IsCpu(false),
-            IsShadowMode(self.is_in_shadow_mode),
-        )?;
-        if !self.is_in_shadow_mode {
-            tracker.mem = tracker.mem.saturating_add(mem_charged);
-        }
         self.mem_bytes
-            .check_budget_limit(IsShadowMode(self.is_in_shadow_mode))
+            .charge(ty, iterations, input, IsCpu(false), IsShadowMode(true))?;
+        self.mem_bytes.check_budget_limit(IsShadowMode(true))
     }
 
     fn get_wasmi_fuel_remaining(&self) -> Result<u64, HostError> {

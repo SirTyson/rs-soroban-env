@@ -154,6 +154,17 @@ impl BudgetDimension {
         }
     }
 
+    /// Fast path for non-shadow mode limit check (hot path optimization).
+    /// Skips the shadow mode check since is_shadow is always false here.
+    #[inline(always)]
+    pub(crate) fn check_budget_limit_direct(&self) -> Result<(), HostError> {
+        if self.total_count > self.limit {
+            Err((ScErrorType::Budget, ScErrorCode::ExceededLimit).into())
+        } else {
+            Ok(())
+        }
+    }
+
     /// Performs a bulk charge to the budget under the specified `CostType`.
     /// If the input is `Some`, then the total input charged is iterations *
     /// input, assuming all batched units have the same input size. If input
@@ -184,6 +195,21 @@ impl BudgetDimension {
             self.total_count = self.total_count.saturating_add(amount);
         }
 
+        Ok(amount)
+    }
+
+    /// Fast path for non-shadow mode charging (hot path optimization).
+    /// Skips Tracy instrumentation and shadow mode checks.
+    #[inline(always)]
+    pub(crate) fn charge_direct(
+        &mut self,
+        ty: ContractCostType,
+        iterations: u64,
+        input: Option<u64>,
+    ) -> Result<u64, HostError> {
+        let cm = self.get_cost_model(ty)?;
+        let amount = cm.evaluate(iterations, input)?;
+        self.total_count = self.total_count.saturating_add(amount);
         Ok(amount)
     }
 
