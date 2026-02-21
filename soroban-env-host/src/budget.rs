@@ -237,13 +237,15 @@ impl BudgetImpl {
         iterations: u64,
         input: Option<u64>,
     ) -> Result<(), HostError> {
-        let tracker = self
-            .tracker
-            .cost_trackers
-            .get_mut(ty as usize)
-            .ok_or_else(|| HostError::from((ScErrorType::Budget, ScErrorCode::InternalError)))?;
-
+        #[cfg(any(test, feature = "testutils", feature = "recording_mode"))]
         if !self.is_in_shadow_mode {
+            let tracker = self
+                .tracker
+                .cost_trackers
+                .get_mut(ty as usize)
+                .ok_or_else(|| {
+                    HostError::from((ScErrorType::Budget, ScErrorCode::InternalError))
+                })?;
             // update tracker for reporting
             self.tracker.meter_count = self.tracker.meter_count.saturating_add(1);
             tracker.iterations = tracker.iterations.saturating_add(iterations);
@@ -255,29 +257,31 @@ impl BudgetImpl {
             };
         }
 
-        let cpu_charged = self.cpu_insns.charge(
+        let _cpu_charged = self.cpu_insns.charge(
             ty,
             iterations,
             input,
             IsCpu(true),
             IsShadowMode(self.is_in_shadow_mode),
         )?;
-        if !self.is_in_shadow_mode {
-            tracker.cpu = tracker.cpu.saturating_add(cpu_charged);
-        }
         self.cpu_insns
             .check_budget_limit(IsShadowMode(self.is_in_shadow_mode))?;
 
-        let mem_charged = self.mem_bytes.charge(
+        let _mem_charged = self.mem_bytes.charge(
             ty,
             iterations,
             input,
             IsCpu(false),
             IsShadowMode(self.is_in_shadow_mode),
         )?;
+
+        #[cfg(any(test, feature = "testutils", feature = "recording_mode"))]
         if !self.is_in_shadow_mode {
-            tracker.mem = tracker.mem.saturating_add(mem_charged);
+            let tracker = &mut self.tracker.cost_trackers[ty as usize];
+            tracker.cpu = tracker.cpu.saturating_add(_cpu_charged);
+            tracker.mem = tracker.mem.saturating_add(_mem_charged);
         }
+
         self.mem_bytes
             .check_budget_limit(IsShadowMode(self.is_in_shadow_mode))
     }
@@ -1265,6 +1269,23 @@ impl Budget {
         )?))))
     }
 
+    /// Resets the budget for a new transaction, reusing the existing cost
+    /// models. This avoids the overhead of deserializing cost params and
+    /// rebuilding cost models when they haven't changed between transactions.
+    pub fn reset_for_new_tx(&self, cpu_limit: u64, mem_limit: u64) {
+        let mut bi = self.0.borrow_mut();
+        bi.cpu_insns.total_count = 0;
+        bi.cpu_insns.shadow_total_count = 0;
+        bi.cpu_insns.limit = cpu_limit;
+        bi.cpu_insns.shadow_limit = cpu_limit;
+        bi.mem_bytes.total_count = 0;
+        bi.mem_bytes.shadow_total_count = 0;
+        bi.mem_bytes.limit = mem_limit;
+        bi.mem_bytes.shadow_limit = mem_limit;
+        bi.tracker = BudgetTracker::default();
+        bi.is_in_shadow_mode = false;
+    }
+
     /// Initializes the budget from network configuration settings.
     /// Allows customizing the shadow CPU/memory limits.
     pub fn try_from_configs_with_shadow_limits(
@@ -1312,7 +1333,14 @@ impl Budget {
     /// Otherwise it is a linear model.  The caller needs to ensure the input
     /// passed is consistent with the inherent model underneath.
     pub fn charge(&self, ty: ContractCostType, input: Option<u64>) -> Result<(), HostError> {
-        self.0.try_borrow_mut_or_err()?.charge(ty, 1, input)
+        #[cfg(any(test, feature = "testutils"))]
+        return self.0.try_borrow_mut_or_err()?.charge(ty, 1, input);
+
+        #[cfg(not(any(test, feature = "testutils")))]
+        // Safety: Budget is only accessed from a single thread during Soroban
+        // invocation. No recursive or concurrent borrows are possible in the
+        // charge path.
+        return unsafe { &mut *self.0.as_ptr() }.charge(ty, 1, input);
     }
 
     pub(crate) fn get_memory_cost(
