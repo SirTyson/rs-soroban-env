@@ -197,13 +197,27 @@ fn get_ledger_changes(
     };
     for (key, entry_with_live_until_ledger) in storage.map.iter(budget)? {
         let mut entry_change = LedgerEntryChange::default();
+        // In production mode, skip serializing encoded_key since downstream
+        // callers (extract_ledger_effects, extract_rent_changes) never read it.
+        #[cfg(any(test, feature = "recording_mode"))]
         metered_write_xdr(budget, key.as_ref(), &mut entry_change.encoded_key)?;
         let durability = get_key_durability(key);
 
         if let Some(durability) = durability {
             let key_hash = match init_ttl_entries.get::<Rc<LedgerKey>>(key, budget)? {
                 Some(ttl_entry) => ttl_entry.key_hash.0.to_vec(),
-                None => sha256_hash_from_bytes(entry_change.encoded_key.as_slice(), budget)?,
+                None => {
+                    #[cfg(any(test, feature = "recording_mode"))]
+                    {
+                        sha256_hash_from_bytes(entry_change.encoded_key.as_slice(), budget)?
+                    }
+                    #[cfg(not(any(test, feature = "recording_mode")))]
+                    {
+                        let mut key_buf = vec![];
+                        metered_write_xdr(budget, key.as_ref(), &mut key_buf)?;
+                        sha256_hash_from_bytes(&key_buf, budget)?
+                    }
+                }
             };
 
             entry_change.ttl_change = Some(LedgerEntryLiveUntilChange {
