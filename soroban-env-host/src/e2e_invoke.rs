@@ -456,20 +456,26 @@ pub fn invoke_host_function<T: AsRef<[u8]>, I: ExactSizeIterator<Item = T>>(
 ) -> Result<InvokeHostFunctionResult, HostError> {
     let _span0 = tracy_span!("invoke_host_function");
 
-    let resources: SorobanResources =
-        metered_from_xdr_with_budget(encoded_resources.as_ref(), &budget)?;
-    let restored_keys = build_restored_key_set(&budget, &resources, &restored_rw_entry_indices)?;
-    let footprint = build_storage_footprint_from_xdr(&budget, resources.footprint)?;
-    let current_ledger_seq = ledger_info.sequence_number;
-    let min_live_until_ledger = ledger_info
-        .min_live_until_ledger_checked(ContractDataDurability::Persistent)
-        .ok_or_else(|| {
-            HostError::from(Error::from_type_and_code(
-                ScErrorType::Context,
-                ScErrorCode::InternalError,
-            ))
-        })?;
-    let (storage_map, init_ttl_map, _init_entry_sizes) =
+    let (footprint, restored_keys, current_ledger_seq, min_live_until_ledger) = {
+        let _span_fp = tracy_span!("build footprint");
+        let resources: SorobanResources =
+            metered_from_xdr_with_budget(encoded_resources.as_ref(), &budget)?;
+        let restored_keys =
+            build_restored_key_set(&budget, &resources, &restored_rw_entry_indices)?;
+        let footprint = build_storage_footprint_from_xdr(&budget, resources.footprint)?;
+        let current_ledger_seq = ledger_info.sequence_number;
+        let min_live_until_ledger = ledger_info
+            .min_live_until_ledger_checked(ContractDataDurability::Persistent)
+            .ok_or_else(|| {
+                HostError::from(Error::from_type_and_code(
+                    ScErrorType::Context,
+                    ScErrorCode::InternalError,
+                ))
+            })?;
+        (footprint, restored_keys, current_ledger_seq, min_live_until_ledger)
+    };
+    let (storage_map, init_ttl_map, _init_entry_sizes) = {
+        let _span_sm = tracy_span!("build storage map");
         build_storage_map_from_xdr_ledger_entries(
             &budget,
             &footprint,
@@ -478,7 +484,8 @@ pub fn invoke_host_function<T: AsRef<[u8]>, I: ExactSizeIterator<Item = T>>(
             current_ledger_seq,
             #[cfg(any(test, feature = "recording_mode"))]
             false,
-        )?;
+        )?
+    };
 
     // In production mode, skip the expensive metered clone of the storage map.
     // The init_entry_sizes (with pre-computed rent sizes) and init_ttl_entries
@@ -488,66 +495,80 @@ pub fn invoke_host_function<T: AsRef<[u8]>, I: ExactSizeIterator<Item = T>>(
     #[cfg(not(any(test, feature = "recording_mode")))]
     let init_storage_map = StorageMap::new();
 
-    let storage = Storage::with_enforcing_footprint_and_map(footprint, storage_map);
-    let host = Host::with_storage_and_budget(storage, budget.clone());
-    let have_trace_hook = trace_hook.is_some();
-    if let Some(th) = trace_hook {
-        host.set_trace_hook(Some(th))?;
-    }
-    let auth_entries = host.build_auth_entries_from_xdr(encoded_auth_entries)?;
-    let host_function: HostFunction = host.metered_from_xdr(encoded_host_fn.as_ref())?;
-    let source_account: AccountId = host.metered_from_xdr(encoded_source_account.as_ref())?;
-    host.set_source_account(source_account)?;
-    host.set_ledger_info(ledger_info)?;
-    host.set_authorization_entries(auth_entries)?;
-    let seed32: [u8; 32] = base_prng_seed.as_ref().try_into().map_err(|_| {
-        host.err(
-            ScErrorType::Context,
-            ScErrorCode::InternalError,
-            "base PRNG seed is not 32-bytes long",
-            &[],
-        )
-    })?;
-    host.set_base_prng_seed(seed32)?;
-    if enable_diagnostics {
-        host.set_diagnostic_level(DiagnosticLevel::Debug)?;
-    }
-    if let Some(module_cache) = module_cache {
-        host.set_module_cache(module_cache)?;
-    }
+    let (host, host_function, have_trace_hook) = {
+        let _span_hs = tracy_span!("host setup");
+        let storage = Storage::with_enforcing_footprint_and_map(footprint, storage_map);
+        let host = Host::with_storage_and_budget(storage, budget.clone());
+        let have_trace_hook = trace_hook.is_some();
+        if let Some(th) = trace_hook {
+            host.set_trace_hook(Some(th))?;
+        }
+        let auth_entries = host.build_auth_entries_from_xdr(encoded_auth_entries)?;
+        let host_function: HostFunction = host.metered_from_xdr(encoded_host_fn.as_ref())?;
+        let source_account: AccountId = host.metered_from_xdr(encoded_source_account.as_ref())?;
+        host.set_source_account(source_account)?;
+        host.set_ledger_info(ledger_info)?;
+        host.set_authorization_entries(auth_entries)?;
+        let seed32: [u8; 32] = base_prng_seed.as_ref().try_into().map_err(|_| {
+            host.err(
+                ScErrorType::Context,
+                ScErrorCode::InternalError,
+                "base PRNG seed is not 32-bytes long",
+                &[],
+            )
+        })?;
+        host.set_base_prng_seed(seed32)?;
+        if enable_diagnostics {
+            host.set_diagnostic_level(DiagnosticLevel::Debug)?;
+        }
+        if let Some(module_cache) = module_cache {
+            host.set_module_cache(module_cache)?;
+        }
+        (host, host_function, have_trace_hook)
+    };
     let result = {
         let _span1 = tracy_span!("Host::invoke_function");
         host.invoke_function(host_function)
     };
-    if have_trace_hook {
-        host.set_trace_hook(None)?;
-    }
-    let (storage, events) = host.try_finish()?;
-    if enable_diagnostics {
-        extract_diagnostic_events(&events, diagnostic_events);
-    }
+    let (storage, events) = {
+        let _span_tf = tracy_span!("host try_finish");
+        if have_trace_hook {
+            host.set_trace_hook(None)?;
+        }
+        let (storage, events) = host.try_finish()?;
+        if enable_diagnostics {
+            extract_diagnostic_events(&events, diagnostic_events);
+        }
+        (storage, events)
+    };
     let encoded_invoke_result = result.and_then(|res| {
         let mut encoded_result_sc_val = vec![];
         metered_write_xdr(&budget, &res, &mut encoded_result_sc_val).map(|_| encoded_result_sc_val)
     });
     if encoded_invoke_result.is_ok() {
-        let init_storage_snapshot = StorageMapSnapshotSource {
-            budget: &budget,
-            map: &init_storage_map,
+        let ledger_changes = {
+            let _span_lc = tracy_span!("get_ledger_changes");
+            let init_storage_snapshot = StorageMapSnapshotSource {
+                budget: &budget,
+                map: &init_storage_map,
+            };
+            get_ledger_changes(
+                &budget,
+                &storage,
+                &init_storage_snapshot,
+                init_ttl_map,
+                min_live_until_ledger,
+                &restored_keys,
+                #[cfg(not(any(test, feature = "recording_mode")))]
+                &_init_entry_sizes,
+                #[cfg(any(test, feature = "recording_mode"))]
+                current_ledger_seq,
+            )?
         };
-        let ledger_changes = get_ledger_changes(
-            &budget,
-            &storage,
-            &init_storage_snapshot,
-            init_ttl_map,
-            min_live_until_ledger,
-            &restored_keys,
-            #[cfg(not(any(test, feature = "recording_mode")))]
-            &_init_entry_sizes,
-            #[cfg(any(test, feature = "recording_mode"))]
-            current_ledger_seq,
-        )?;
-        let encoded_contract_events = encode_contract_events(budget, &events)?;
+        let encoded_contract_events = {
+            let _span_ec = tracy_span!("encode_contract_events");
+            encode_contract_events(budget, &events)?
+        };
         Ok(InvokeHostFunctionResult {
             encoded_invoke_result,
             ledger_changes,
