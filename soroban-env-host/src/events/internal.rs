@@ -22,13 +22,22 @@ pub(crate) struct InternalContractEvent {
 impl InternalContractEvent {
     // Metering: covered by components
     fn to_xdr(&self, host: &Host) -> Result<xdr::ContractEvent, HostError> {
-        let topics = host.vecobject_to_scval_vec(self.topics)?;
-        let data = host.from_host_val(self.data)?;
-        let contract_id = match self.contract_id {
-            Some(id) => Some(ContractId(
-                host.hash_from_bytesobj_input("contract_id", id)?,
-            )),
-            None => None,
+        let topics = {
+            let _span = tracy_span!("convert event topics");
+            host.vecobject_to_scval_vec(self.topics)?
+        };
+        let data = {
+            let _span = tracy_span!("convert event data");
+            host.from_host_val(self.data)?
+        };
+        let contract_id = {
+            let _span = tracy_span!("convert contract id");
+            match self.contract_id {
+                Some(id) => Some(ContractId(
+                    host.hash_from_bytesobj_input("contract_id", id)?,
+                )),
+                None => None,
+            }
         };
         Ok(xdr::ContractEvent {
             ext: xdr::ExtensionPoint::V0,

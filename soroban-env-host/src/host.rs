@@ -743,7 +743,11 @@ impl Host {
     /// Use [`Host::can_finish`] to determine before calling the function if it
     /// will succeed.
     pub fn try_finish(self) -> Result<(Storage, Events), HostError> {
-        let events = self.try_borrow_events()?.externalize(&self)?;
+        let events = {
+            let _span = tracy_span!("externalize events");
+            self.try_borrow_events()?.externalize(&self)?
+        };
+        let _span = tracy_span!("drop host extract storage");
         Rc::try_unwrap(self.0)
             .map(|host_impl| {
                 let storage = host_impl.storage.into_inner();
