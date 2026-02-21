@@ -179,6 +179,7 @@ fn get_ledger_changes(
     init_ttl_entries: TtlEntryMap,
     min_live_until_ledger: u32,
     restored_keys: &Option<RestoredKeySet>,
+    #[cfg(not(any(test, feature = "recording_mode")))] init_entry_sizes: &[(Rc<LedgerKey>, u32)],
     #[cfg(any(test, feature = "recording_mode"))] current_ledger_seq: u32,
 ) -> Result<Vec<LedgerEntryChange>, HostError> {
     // Skip allocation metering for this for the sake of simplicity - the
@@ -230,11 +231,23 @@ fn get_ledger_changes(
         }
         let entry_with_live_until = init_storage_snapshot.get(key)?;
         if let Some((old_entry, old_live_until_ledger)) = entry_with_live_until {
-            let mut buf = vec![];
-            metered_write_xdr(budget, old_entry.as_ref(), &mut buf)?;
+            // In production, use cached XDR sizes from initial deserialization
+            // instead of re-serializing old entries just to compute their size.
+            #[cfg(not(any(test, feature = "recording_mode")))]
+            let old_xdr_size = init_entry_sizes
+                .iter()
+                .find(|(k, _)| k.as_ref() == key.as_ref())
+                .map(|(_, s)| *s)
+                .unwrap_or(0);
+            #[cfg(any(test, feature = "recording_mode"))]
+            let old_xdr_size = {
+                let mut buf = vec![];
+                metered_write_xdr(budget, old_entry.as_ref(), &mut buf)?;
+                buf.len() as u32
+            };
 
             entry_change.old_entry_size_bytes_for_rent =
-                entry_size_for_rent(budget, &old_entry, buf.len() as u32)?;
+                entry_size_for_rent(budget, &old_entry, old_xdr_size)?;
 
             if let Some(ref mut ttl_change) = &mut entry_change.ttl_change {
                 ttl_change.old_live_until_ledger =
@@ -439,15 +452,16 @@ pub fn invoke_host_function<T: AsRef<[u8]>, I: ExactSizeIterator<Item = T>>(
                 ScErrorCode::InternalError,
             ))
         })?;
-    let (storage_map, init_ttl_map) = build_storage_map_from_xdr_ledger_entries(
-        &budget,
-        &footprint,
-        encoded_ledger_entries,
-        encoded_ttl_entries,
-        current_ledger_seq,
-        #[cfg(any(test, feature = "recording_mode"))]
-        false,
-    )?;
+    let (storage_map, init_ttl_map, _init_entry_sizes) =
+        build_storage_map_from_xdr_ledger_entries(
+            &budget,
+            &footprint,
+            encoded_ledger_entries,
+            encoded_ttl_entries,
+            current_ledger_seq,
+            #[cfg(any(test, feature = "recording_mode"))]
+            false,
+        )?;
 
     let init_storage_map = storage_map.metered_clone(budget)?;
 
@@ -505,6 +519,8 @@ pub fn invoke_host_function<T: AsRef<[u8]>, I: ExactSizeIterator<Item = T>>(
             init_ttl_map,
             min_live_until_ledger,
             &restored_keys,
+            #[cfg(not(any(test, feature = "recording_mode")))]
+            &_init_entry_sizes,
             #[cfg(any(test, feature = "recording_mode"))]
             current_ledger_seq,
         )?;
@@ -785,7 +801,7 @@ pub fn invoke_host_function_in_recording_mode(
                     current_rw_id += 1;
                 }
             }
-            let (init_storage, init_ttl_map) = build_storage_map_from_xdr_ledger_entries(
+            let (init_storage, init_ttl_map, _) = build_storage_map_from_xdr_ledger_entries(
                 &budget,
                 &storage.footprint,
                 encoded_ledger_entries.iter(),
@@ -965,9 +981,10 @@ fn build_storage_map_from_xdr_ledger_entries<T: AsRef<[u8]>, I: ExactSizeIterato
     encoded_ttl_entries: I,
     ledger_num: u32,
     #[cfg(any(test, feature = "recording_mode"))] is_recording_mode: bool,
-) -> Result<(StorageMap, TtlEntryMap), HostError> {
+) -> Result<(StorageMap, TtlEntryMap, Vec<(Rc<LedgerKey>, u32)>), HostError> {
     let mut storage_map = StorageMap::new();
     let mut ttl_map = TtlEntryMap::new();
+    let mut init_entry_sizes: Vec<(Rc<LedgerKey>, u32)> = Vec::new();
 
     if encoded_ledger_entries.len() != encoded_ttl_entries.len() {
         return Err(
@@ -976,6 +993,7 @@ fn build_storage_map_from_xdr_ledger_entries<T: AsRef<[u8]>, I: ExactSizeIterato
     }
 
     for (entry_buf, ttl_buf) in encoded_ledger_entries.zip(encoded_ttl_entries) {
+        let entry_xdr_size = entry_buf.as_ref().len() as u32;
         let mut live_until_ledger: Option<u32> = None;
 
         let le = Rc::metered_new(
@@ -1042,6 +1060,7 @@ fn build_storage_map_from_xdr_ledger_entries<T: AsRef<[u8]>, I: ExactSizeIterato
             )
             .into());
         }
+        init_entry_sizes.push((Rc::clone(&key), entry_xdr_size));
         storage_map = storage_map.insert(key, Some((le, live_until_ledger)), budget)?;
     }
 
@@ -1051,7 +1070,7 @@ fn build_storage_map_from_xdr_ledger_entries<T: AsRef<[u8]>, I: ExactSizeIterato
             storage_map = storage_map.insert(Rc::clone(k), None, budget)?;
         }
     }
-    Ok((storage_map, ttl_map))
+    Ok((storage_map, ttl_map, init_entry_sizes))
 }
 
 impl Host {
