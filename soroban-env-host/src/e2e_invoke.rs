@@ -182,6 +182,11 @@ fn get_ledger_changes(
     #[cfg(not(any(test, feature = "recording_mode")))] init_entry_sizes: &[(Rc<LedgerKey>, u32)],
     #[cfg(any(test, feature = "recording_mode"))] current_ledger_seq: u32,
 ) -> Result<Vec<LedgerEntryChange>, HostError> {
+    // In production mode, init_storage_snapshot is unused (we use
+    // init_entry_sizes and init_ttl_entries instead).
+    #[cfg(not(any(test, feature = "recording_mode")))]
+    let _ = &init_storage_snapshot;
+
     // Skip allocation metering for this for the sake of simplicity - the
     // bounding factor here is XDR decoding which is metered.
     let mut changes = Vec::with_capacity(storage.map.len());
@@ -205,8 +210,13 @@ fn get_ledger_changes(
         let durability = get_key_durability(key);
 
         if let Some(durability) = durability {
+            // Save old_live_until from TTL entry to avoid redundant lookup later
+            let mut old_live_until_from_ttl: Option<u32> = None;
             let key_hash = match init_ttl_entries.get::<Rc<LedgerKey>>(key, budget)? {
-                Some(ttl_entry) => ttl_entry.key_hash.0.to_vec(),
+                Some(ttl_entry) => {
+                    old_live_until_from_ttl = Some(ttl_entry.live_until_ledger_seq);
+                    ttl_entry.key_hash.0.to_vec()
+                }
                 None => {
                     #[cfg(any(test, feature = "recording_mode"))]
                     {
@@ -228,39 +238,46 @@ fn get_ledger_changes(
                 old_live_until_ledger: 0,
                 new_live_until_ledger: 0,
             });
-        }
-        let entry_with_live_until = init_storage_snapshot.get(key)?;
-        if let Some((old_entry, old_live_until_ledger)) = entry_with_live_until {
-            // In production, use cached XDR sizes from initial deserialization
-            // instead of re-serializing old entries just to compute their size.
+
+            // In production, set old_live_until_ledger from the TTL entry
+            // we already looked up above, avoiding the init_storage_snapshot.
             #[cfg(not(any(test, feature = "recording_mode")))]
-            let old_xdr_size = init_entry_sizes
-                .iter()
-                .find(|(k, _)| k.as_ref() == key.as_ref())
-                .map(|(_, s)| *s)
-                .unwrap_or(0);
-            #[cfg(any(test, feature = "recording_mode"))]
-            let old_xdr_size = {
-                let mut buf = vec![];
-                metered_write_xdr(budget, old_entry.as_ref(), &mut buf)?;
-                buf.len() as u32
-            };
-
-            entry_change.old_entry_size_bytes_for_rent =
-                entry_size_for_rent(budget, &old_entry, old_xdr_size)?;
-
             if let Some(ref mut ttl_change) = &mut entry_change.ttl_change {
-                ttl_change.old_live_until_ledger =
-                    old_live_until_ledger.ok_or_else(internal_error)?;
-                // In recording mode we might encounter ledger changes that have an expired 'old'
-                // entry. In that case we should treat it as non-existent instead.
-                // Note, that this should only be necessary for the temporary
-                // entries, the auto-restored persistent entries are handled below
-                // via `restored_keys` check.
-                #[cfg(any(test, feature = "recording_mode"))]
-                if ttl_change.old_live_until_ledger < current_ledger_seq {
-                    ttl_change.old_live_until_ledger = 0;
-                    entry_change.old_entry_size_bytes_for_rent = 0;
+                if let Some(old_lul) = old_live_until_from_ttl {
+                    ttl_change.old_live_until_ledger = old_lul;
+                }
+            }
+        }
+        // In production, use pre-computed rent sizes from init_entry_sizes
+        // instead of looking up old entries from the init storage snapshot.
+        #[cfg(not(any(test, feature = "recording_mode")))]
+        if let Some((_, rent_size)) = init_entry_sizes
+            .iter()
+            .find(|(k, _)| k.as_ref() == key.as_ref())
+        {
+            entry_change.old_entry_size_bytes_for_rent = *rent_size;
+        }
+        // In test/recording mode, use the full snapshot for old entry data.
+        #[cfg(any(test, feature = "recording_mode"))]
+        {
+            let entry_with_live_until = init_storage_snapshot.get(key)?;
+            if let Some((old_entry, old_live_until_ledger)) = entry_with_live_until {
+                let old_xdr_size = {
+                    let mut buf = vec![];
+                    metered_write_xdr(budget, old_entry.as_ref(), &mut buf)?;
+                    buf.len() as u32
+                };
+
+                entry_change.old_entry_size_bytes_for_rent =
+                    entry_size_for_rent(budget, &old_entry, old_xdr_size)?;
+
+                if let Some(ref mut ttl_change) = &mut entry_change.ttl_change {
+                    ttl_change.old_live_until_ledger =
+                        old_live_until_ledger.ok_or_else(internal_error)?;
+                    if ttl_change.old_live_until_ledger < current_ledger_seq {
+                        ttl_change.old_live_until_ledger = 0;
+                        entry_change.old_entry_size_bytes_for_rent = 0;
+                    }
                 }
             }
         }
@@ -463,7 +480,13 @@ pub fn invoke_host_function<T: AsRef<[u8]>, I: ExactSizeIterator<Item = T>>(
             false,
         )?;
 
+    // In production mode, skip the expensive metered clone of the storage map.
+    // The init_entry_sizes (with pre-computed rent sizes) and init_ttl_entries
+    // provide all the data needed for get_ledger_changes.
+    #[cfg(any(test, feature = "recording_mode"))]
     let init_storage_map = storage_map.metered_clone(budget)?;
+    #[cfg(not(any(test, feature = "recording_mode")))]
+    let init_storage_map = StorageMap::new();
 
     let storage = Storage::with_enforcing_footprint_and_map(footprint, storage_map);
     let host = Host::with_storage_and_budget(storage, budget.clone());
@@ -1060,7 +1083,8 @@ fn build_storage_map_from_xdr_ledger_entries<T: AsRef<[u8]>, I: ExactSizeIterato
             )
             .into());
         }
-        init_entry_sizes.push((Rc::clone(&key), entry_xdr_size));
+        let rent_size = entry_size_for_rent(budget, &le, entry_xdr_size)?;
+        init_entry_sizes.push((Rc::clone(&key), rent_size));
         storage_map = storage_map.insert(key, Some((le, live_until_ledger)), budget)?;
     }
 
