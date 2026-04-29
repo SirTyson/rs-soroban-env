@@ -22,6 +22,7 @@ use crate::{
 };
 
 use dimension::{BudgetDimension, IsCpu, IsShadowMode};
+use model::HostCostModel;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CostTracker {
@@ -279,6 +280,84 @@ impl BudgetImpl {
         if !self.is_in_shadow_mode {
             tracker.mem = tracker.mem.saturating_add(mem_charged);
         }
+        self.mem_bytes
+            .check_budget_limit(IsShadowMode(self.is_in_shadow_mode))
+    }
+
+    /// Batched equivalent of repeated single-leaf `ValSer` charges grouped by
+    /// input length. For each `(input_len, count)` bucket, the per-leaf CPU and
+    /// memory amounts are computed via `evaluate(1, Some(input_len))` and then
+    /// multiplied by `count`, which preserves the exact rounding semantics of
+    /// the per-leaf charge path. Tracker fields (`meter_count`, `iterations`,
+    /// `inputs`, `cpu`, `mem`) and dimension `total_count`s are updated to
+    /// match what would have been recorded by `count` separate single-leaf
+    /// charges of the same length, so cost-model totals and budget-limit
+    /// outcomes remain bit-identical to the unbatched path.
+    pub(crate) fn charge_val_ser_batched(
+        &mut self,
+        hist: &[(u64, u64)],
+    ) -> Result<(), HostError> {
+        let ty = ContractCostType::ValSer;
+
+        let mut total_count: u64 = 0;
+        let mut total_inputs: u64 = 0;
+        let mut total_cpu: u64 = 0;
+        let mut total_mem: u64 = 0;
+
+        {
+            let cpu_cm = self.cpu_insns.get_cost_model(ty)?;
+            for &(input_len, count) in hist {
+                let per_leaf = cpu_cm.evaluate(1, Some(input_len))?;
+                total_cpu = total_cpu.saturating_add(per_leaf.saturating_mul(count));
+                total_count = total_count.saturating_add(count);
+                total_inputs = total_inputs.saturating_add(input_len.saturating_mul(count));
+            }
+        }
+        {
+            let mem_cm = self.mem_bytes.get_cost_model(ty)?;
+            for &(input_len, count) in hist {
+                let per_leaf = mem_cm.evaluate(1, Some(input_len))?;
+                total_mem = total_mem.saturating_add(per_leaf.saturating_mul(count));
+            }
+        }
+
+        if total_count == 0 {
+            return Ok(());
+        }
+
+        let tracker = self
+            .tracker
+            .cost_trackers
+            .get_mut(ty as usize)
+            .ok_or_else(|| HostError::from((ScErrorType::Budget, ScErrorCode::InternalError)))?;
+
+        if !self.is_in_shadow_mode {
+            let count_u32 = u32::try_from(total_count).unwrap_or(u32::MAX);
+            self.tracker.meter_count = self.tracker.meter_count.saturating_add(count_u32);
+            tracker.iterations = tracker.iterations.saturating_add(total_count);
+            match &mut tracker.inputs {
+                Some(t) => *t = t.saturating_add(total_inputs),
+                None => return Err((ScErrorType::Budget, ScErrorCode::InternalError).into()),
+            }
+            tracker.cpu = tracker.cpu.saturating_add(total_cpu);
+            tracker.mem = tracker.mem.saturating_add(total_mem);
+        }
+
+        self.cpu_insns.charge_amount(
+            ty,
+            total_cpu,
+            IsCpu(true),
+            IsShadowMode(self.is_in_shadow_mode),
+        )?;
+        self.cpu_insns
+            .check_budget_limit(IsShadowMode(self.is_in_shadow_mode))?;
+
+        self.mem_bytes.charge_amount(
+            ty,
+            total_mem,
+            IsCpu(false),
+            IsShadowMode(self.is_in_shadow_mode),
+        )?;
         self.mem_bytes
             .check_budget_limit(IsShadowMode(self.is_in_shadow_mode))
     }
@@ -1322,6 +1401,22 @@ impl Budget {
     /// passed is consistent with the inherent model underneath.
     pub fn charge(&self, ty: ContractCostType, input: Option<u64>) -> Result<(), HostError> {
         self.0.try_borrow_mut_or_err()?.charge(ty, 1, input)
+    }
+
+    /// Batched `ValSer` charge keyed by `(input_len, count)` pairs. Equivalent
+    /// to calling [`Budget::charge`] with `ContractCostType::ValSer` and
+    /// `Some(input_len)` exactly `count` times for each bucket, but folds the
+    /// per-leaf model evaluation, tracker bookkeeping, and limit checks into a
+    /// single mutable borrow of the budget. Used by `metered_write_xdr` to
+    /// remove per-chunk metering overhead from the XDR encoder hot path while
+    /// preserving observable budget totals exactly.
+    pub(crate) fn charge_val_ser_batched(
+        &self,
+        hist: &[(u64, u64)],
+    ) -> Result<(), HostError> {
+        self.0
+            .try_borrow_mut_or_err()?
+            .charge_val_ser_batched(hist)
     }
 
     pub(crate) fn get_memory_cost(

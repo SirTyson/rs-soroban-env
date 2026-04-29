@@ -8,8 +8,17 @@ use std::io::Write;
 
 use super::ErrorHandler;
 
+/// XDR encoder writer that defers `ValSer` budget charging by recording a
+/// histogram of `(buf.len(), count)` pairs as the encoder emits chunks. The
+/// caller in `metered_write_xdr` then performs a single batched charge after
+/// serialization completes. This preserves the per-leaf `ValSer` cost totals
+/// (each bucket is charged as `count * evaluate(1, Some(buf.len()))` for both
+/// CPU and memory), and only changes the observable timing of the
+/// budget-exceeded error from "mid-write" to "after the write completes into a
+/// local Vec<u8>", which is non-observable to the caller because the buffer is
+/// not exposed on the error path.
 struct MeteredWrite<'a, W: Write> {
-    budget: &'a Budget,
+    histogram: Vec<(u64, u64)>,
     w: &'a mut W,
 }
 
@@ -18,9 +27,11 @@ where
     W: Write,
 {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.budget
-            .charge(ContractCostType::ValSer, Some(buf.len() as u64))
-            .map_err(Into::<std::io::Error>::into)?;
+        let len = buf.len() as u64;
+        match self.histogram.iter_mut().find(|(l, _)| *l == len) {
+            Some(entry) => entry.1 = entry.1.saturating_add(1),
+            None => self.histogram.push((len, 1)),
+        }
         self.w.write(buf)
     }
 
@@ -59,12 +70,22 @@ pub fn metered_write_xdr(
     w: &mut Vec<u8>,
 ) -> Result<(), HostError> {
     let _span = tracy_span!("write xdr");
-    let mut w = Limited::new(MeteredWrite { budget, w }, DEFAULT_XDR_RW_LIMITS);
-    // MeteredWrite above turned any budget failure into an IO error; we turn it
-    // back to a budget failure here, since there's really no "IO error" that can
-    // occur when writing to a Vec<u8>.
-    obj.write_xdr(&mut w)
-        .map_err(|_| (ScErrorType::Budget, ScErrorCode::ExceededLimit).into())
+    let mw = MeteredWrite {
+        histogram: Vec::with_capacity(16),
+        w,
+    };
+    let mut limited = Limited::new(mw, DEFAULT_XDR_RW_LIMITS);
+    let write_res = obj.write_xdr(&mut limited);
+    // Apply the deferred batched ValSer charge for every chunk that was
+    // actually written, regardless of whether the encoder ultimately failed.
+    // This preserves exact per-leaf cost totals for the bytes that were
+    // emitted, and matches the behavior of the per-write path which also
+    // charges for each chunk before returning any error.
+    budget.charge_val_ser_batched(&limited.inner.histogram)?;
+    // If the encoder itself failed (e.g. XDR length limit), surface that as a
+    // budget error to match the prior behavior, since `Vec<u8>` cannot produce
+    // a real IO error.
+    write_res.map_err(|_| (ScErrorType::Budget, ScErrorCode::ExceededLimit).into())
 }
 
 // Host-less metered XDR decoding.

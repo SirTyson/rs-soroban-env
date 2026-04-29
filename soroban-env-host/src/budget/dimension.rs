@@ -187,6 +187,35 @@ impl BudgetDimension {
         Ok(amount)
     }
 
+    /// Adds a precomputed `amount` to this dimension's running total without
+    /// re-evaluating the cost model. This is used by batched/aggregated charge
+    /// paths (e.g. ValSer histogram charging in `metered_write_xdr`) where the
+    /// caller has already computed the exact per-leaf-equivalent amount via the
+    /// cost model and just needs to apply it to the dimension total. The Tracy
+    /// `charge` span is still emitted for CPU charges so trace-level accounting
+    /// remains comparable to the per-leaf path.
+    pub(crate) fn charge_amount(
+        &mut self,
+        _ty: ContractCostType,
+        amount: u64,
+        _is_cpu: IsCpu,
+        is_shadow: IsShadowMode,
+    ) -> Result<(), HostError> {
+        #[cfg(all(not(target_family = "wasm"), feature = "tracy"))]
+        if _is_cpu.0 {
+            let _span = tracy_span!("charge");
+            _span.emit_text(_ty.name());
+            _span.emit_value(amount);
+        }
+
+        if is_shadow.0 {
+            self.shadow_total_count = self.shadow_total_count.saturating_add(amount);
+        } else {
+            self.total_count = self.total_count.saturating_add(amount);
+        }
+        Ok(())
+    }
+
     pub(crate) fn get_cost(
         &self,
         ty: ContractCostType,
