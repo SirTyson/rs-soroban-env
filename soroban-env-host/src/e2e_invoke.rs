@@ -193,7 +193,6 @@ fn get_ledger_changes(
     // bounding factor here is XDR decoding which is metered.
     let mut changes = Vec::with_capacity(storage.map.len());
 
-    let footprint_map = &storage.footprint.0;
     // We return any invariant errors here as internal errors, as they would
     // typically mean inconsistency between storage and snapshot that shouldn't
     // happen in embedder environments, or simply fundamental invariant bugs.
@@ -254,8 +253,7 @@ fn get_ledger_changes(
                 );
             }
         }
-        let maybe_access_type: Option<AccessType> =
-            footprint_map.get::<Rc<LedgerKey>>(key, budget)?.copied();
+        let maybe_access_type = storage.get_access_type(key, budget)?;
         match maybe_access_type {
             Some(AccessType::ReadOnly) => {
                 entry_change.read_only = true;

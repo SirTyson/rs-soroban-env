@@ -320,6 +320,30 @@ impl Storage {
         self.footprint.enforce_access(key, ty, budget)
     }
 
+    pub(crate) fn get_access_type(
+        &self,
+        key: &Rc<LedgerKey>,
+        budget: &Budget,
+    ) -> Result<Option<AccessType>, HostError> {
+        if let Some(idx) = &self.enforce_footprint_idx {
+            if idx.len() == self.footprint.0.map.len() {
+                if let Some(&pos) = idx.get(key.as_ref()) {
+                    return Ok(self
+                        .footprint
+                        .0
+                        .get_at_known_position(pos, budget)?
+                        .copied());
+                }
+                self.footprint.0.charge_lookup(budget)?;
+                return Ok(None);
+            }
+        }
+        self.footprint
+            .0
+            .get::<Rc<LedgerKey>>(key, budget)
+            .map(|access_type| access_type.copied())
+    }
+
     // Helper function the next 3 `get`-variants funnel into.
     fn try_get_full_helper(
         &mut self,
