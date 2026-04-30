@@ -35,9 +35,16 @@ use crate::{storage::EntryWithLiveUntil, vm::wasm_module_memory_cost};
 #[cfg(any(test, feature = "recording_mode"))]
 use sha2::{Digest, Sha256};
 
-type TtlEntryMap = MeteredOrdMap<Rc<LedgerKey>, Rc<TtlEntry>, Budget>;
 type RestoredKeySet = MeteredOrdMap<Rc<LedgerKey>, (), Budget>;
-type InitialEntryXdrSizeMap = MeteredOrdMap<Rc<LedgerKey>, u32, Budget>;
+
+#[derive(Clone)]
+struct InitialEntryMetadata {
+    xdr_size: u32,
+    ttl_entry: Option<Rc<TtlEntry>>,
+}
+
+type InitialEntryMetadataByKey = Vec<(Rc<LedgerKey>, InitialEntryMetadata)>;
+type InitialEntryMetadataByPosition = Vec<Option<InitialEntryMetadata>>;
 
 /// Result of invoking a single host function prepared for embedder consumption.
 pub struct InvokeHostFunctionResult {
@@ -178,6 +185,39 @@ fn saturating_u64_to_u32(value: u64) -> u32 {
     value.try_into().unwrap_or(u32::MAX)
 }
 
+fn initial_entry_metadata_by_position(
+    storage_map: &StorageMap,
+    init_entry_metadata: InitialEntryMetadataByKey,
+    storage_idx: Option<&std::collections::HashMap<LedgerKey, usize>>,
+    missing_is_error: bool,
+) -> Result<InitialEntryMetadataByPosition, HostError> {
+    let mut metadata_by_pos = vec![None; storage_map.len()];
+    for (key, metadata) in init_entry_metadata {
+        let pos = match storage_idx {
+            Some(idx) => idx.get(key.as_ref()).copied(),
+            None => storage_map
+                .map
+                .iter()
+                .position(|(storage_key, _)| storage_key.as_ref() == key.as_ref()),
+        };
+        if let Some(pos) = pos {
+            if let Some(slot) = metadata_by_pos.get_mut(pos) {
+                *slot = Some(metadata);
+            } else {
+                return Err(
+                    Error::from_type_and_code(ScErrorType::Storage, ScErrorCode::InternalError)
+                        .into(),
+                );
+            }
+        } else if missing_is_error {
+            return Err(
+                Error::from_type_and_code(ScErrorType::Storage, ScErrorCode::InternalError).into(),
+            );
+        }
+    }
+    Ok(metadata_by_pos)
+}
+
 /// Returns the difference between the `storage` and its initial snapshot as
 /// `LedgerEntryChanges`.
 /// Returns an entry for every item in `storage` footprint.
@@ -185,8 +225,8 @@ fn get_ledger_changes(
     budget: &Budget,
     storage: &Storage,
     init_storage_snapshot: &(impl SnapshotSource + ?Sized),
-    init_entry_xdr_sizes: Option<&InitialEntryXdrSizeMap>,
-    init_ttl_entries: TtlEntryMap,
+    init_storage_map: Option<&StorageMap>,
+    init_entry_metadata: Option<&[Option<InitialEntryMetadata>]>,
     min_live_until_ledger: u32,
     restored_keys: &Option<RestoredKeySet>,
     #[cfg(any(test, feature = "recording_mode"))] current_ledger_seq: u32,
@@ -205,13 +245,16 @@ fn get_ledger_changes(
             ScErrorCode::InternalError,
         ))
     };
-    for (key, entry_with_live_until_ledger) in storage.map.iter(budget)? {
+    for (pos, (key, entry_with_live_until_ledger)) in storage.map.iter(budget)?.enumerate() {
         let mut entry_change = LedgerEntryChange::default();
         metered_write_xdr(budget, key.as_ref(), &mut entry_change.encoded_key)?;
         let durability = get_key_durability(key);
+        let initial_metadata = init_entry_metadata
+            .and_then(|metadata| metadata.get(pos))
+            .and_then(Option::as_ref);
 
         if let Some(durability) = durability {
-            let key_hash = match init_ttl_entries.get::<Rc<LedgerKey>>(key, budget)? {
+            let key_hash = match initial_metadata.and_then(|metadata| metadata.ttl_entry.as_ref()) {
                 Some(ttl_entry) => ttl_entry.key_hash.0.to_vec(),
                 None => sha256_hash_from_bytes(entry_change.encoded_key.as_slice(), budget)?,
             };
@@ -224,16 +267,19 @@ fn get_ledger_changes(
                 new_live_until_ledger: 0,
             });
         }
-        let entry_with_live_until = init_storage_snapshot.get(key)?;
+        let entry_with_live_until = match init_storage_map {
+            Some(init_storage_map) if init_storage_map.len() == storage.map.len() => {
+                match init_storage_map.get_at_known_position(pos, budget)? {
+                    Some(Some((entry, live_until_ledger))) => {
+                        Some((Rc::clone(entry), *live_until_ledger))
+                    }
+                    Some(None) | None => None,
+                }
+            }
+            _ => init_storage_snapshot.get(key)?,
+        };
         if let Some((old_entry, old_live_until_ledger)) = entry_with_live_until {
-            let old_entry_xdr_size = if let Some(init_entry_xdr_sizes) = init_entry_xdr_sizes {
-                init_entry_xdr_sizes
-                    .get::<Rc<LedgerKey>>(key, budget)?
-                    .copied()
-            } else {
-                None
-            };
-            let old_entry_xdr_size = match old_entry_xdr_size {
+            let old_entry_xdr_size = match initial_metadata.map(|metadata| metadata.xdr_size) {
                 Some(size) => size,
                 None => {
                     let mut buf = vec![];
@@ -269,8 +315,11 @@ fn get_ledger_changes(
                 );
             }
         }
-        let maybe_access_type: Option<AccessType> =
-            footprint_map.get::<Rc<LedgerKey>>(key, budget)?.copied();
+        let maybe_access_type: Option<AccessType> = if footprint_map.len() == storage.map.len() {
+            footprint_map.get_at_known_position(pos, budget)?.copied()
+        } else {
+            footprint_map.get::<Rc<LedgerKey>>(key, budget)?.copied()
+        };
         match maybe_access_type {
             Some(AccessType::ReadOnly) => {
                 entry_change.read_only = true;
@@ -451,7 +500,7 @@ pub fn invoke_host_function<T: AsRef<[u8]>, I: ExactSizeIterator<Item = T>>(
                 ScErrorCode::InternalError,
             ))
         })?;
-    let (storage_map, init_ttl_map, init_entry_xdr_sizes) =
+    let (storage_map, init_entry_metadata) =
         build_storage_map_from_xdr_ledger_entries(
             &budget,
             &footprint,
@@ -465,6 +514,12 @@ pub fn invoke_host_function<T: AsRef<[u8]>, I: ExactSizeIterator<Item = T>>(
     let init_storage_map = storage_map.metered_clone(budget)?;
 
     let storage = Storage::with_enforcing_footprint_and_map(footprint, storage_map);
+    let init_entry_metadata = initial_entry_metadata_by_position(
+        &storage.map,
+        init_entry_metadata,
+        storage.enforce_storage_idx.as_deref(),
+        true,
+    )?;
     let host = Host::with_storage_and_budget(storage, budget.clone());
     let have_trace_hook = trace_hook.is_some();
     if let Some(th) = trace_hook {
@@ -515,8 +570,8 @@ pub fn invoke_host_function<T: AsRef<[u8]>, I: ExactSizeIterator<Item = T>>(
             &budget,
             &storage,
             &init_storage_snapshot,
-            Some(&init_entry_xdr_sizes),
-            init_ttl_map,
+            Some(&init_storage_map),
+            Some(&init_entry_metadata),
             min_live_until_ledger,
             &restored_keys,
             #[cfg(any(test, feature = "recording_mode"))]
@@ -738,8 +793,7 @@ pub fn invoke_host_function_in_recording_mode(
     let (
         footprint,
         disk_read_bytes,
-        init_ttl_map,
-        init_entry_xdr_sizes,
+        init_entry_metadata,
         restored_rw_entry_ids,
         restored_keys,
     ) = host.with_mut_storage(|storage| {
@@ -804,7 +858,7 @@ pub fn invoke_host_function_in_recording_mode(
                 current_rw_id += 1;
             }
         }
-        let (init_storage, init_ttl_map, init_entry_xdr_sizes) =
+        let (init_storage, init_entry_metadata) =
             build_storage_map_from_xdr_ledger_entries(
                 &budget,
                 &storage.footprint,
@@ -817,8 +871,7 @@ pub fn invoke_host_function_in_recording_mode(
         Ok((
             footprint,
             disk_read_bytes,
-            init_ttl_map,
-            init_entry_xdr_sizes,
+            init_entry_metadata,
             restored_rw_entry_ids,
             restored_keys,
         ))
@@ -840,13 +893,15 @@ pub fn invoke_host_function_in_recording_mode(
     } else {
         Some(restored_keys)
     };
+    let init_entry_metadata =
+        initial_entry_metadata_by_position(&storage.map, init_entry_metadata, None, false)?;
     let (ledger_changes, contract_events) = if invoke_result.is_ok() {
         let mut ledger_changes = get_ledger_changes(
             &budget,
             &storage,
             &*ledger_snapshot,
-            Some(&init_entry_xdr_sizes),
-            init_ttl_map,
+            None,
+            Some(&init_entry_metadata),
             min_live_until_ledger,
             &restored_keys,
             ledger_seq,
@@ -988,10 +1043,9 @@ fn build_storage_map_from_xdr_ledger_entries<T: AsRef<[u8]>, I: ExactSizeIterato
     encoded_ttl_entries: I,
     ledger_num: u32,
     #[cfg(any(test, feature = "recording_mode"))] is_recording_mode: bool,
-) -> Result<(StorageMap, TtlEntryMap, InitialEntryXdrSizeMap), HostError> {
+) -> Result<(StorageMap, InitialEntryMetadataByKey), HostError> {
     let mut storage_map = StorageMap::new();
-    let mut ttl_map = TtlEntryMap::new();
-    let mut init_entry_xdr_sizes = InitialEntryXdrSizeMap::new();
+    let mut init_entry_metadata = InitialEntryMetadataByKey::new();
 
     if encoded_ledger_entries.len() != encoded_ttl_entries.len() {
         return Err(
@@ -1049,7 +1103,13 @@ fn build_storage_map_from_xdr_ledger_entries<T: AsRef<[u8]>, I: ExactSizeIterato
 
             live_until_ledger = Some(ttl_entry.live_until_ledger_seq);
 
-            ttl_map = ttl_map.insert(key.clone(), ttl_entry, budget)?;
+            init_entry_metadata.push((
+                Rc::clone(&key),
+                InitialEntryMetadata {
+                    xdr_size: entry_xdr_size,
+                    ttl_entry: Some(ttl_entry),
+                },
+            ));
         } else if matches!(le.as_ref().data, LedgerEntryData::ContractData(_))
             || matches!(le.as_ref().data, LedgerEntryData::ContractCode(_))
         {
@@ -1067,8 +1127,18 @@ fn build_storage_map_from_xdr_ledger_entries<T: AsRef<[u8]>, I: ExactSizeIterato
             )
             .into());
         }
-        init_entry_xdr_sizes =
-            init_entry_xdr_sizes.insert(Rc::clone(&key), entry_xdr_size, budget)?;
+        if !matches!(
+            init_entry_metadata.last(),
+            Some((metadata_key, _)) if metadata_key.as_ref() == key.as_ref()
+        ) {
+            init_entry_metadata.push((
+                Rc::clone(&key),
+                InitialEntryMetadata {
+                    xdr_size: entry_xdr_size,
+                    ttl_entry: None,
+                },
+            ));
+        }
         storage_map = storage_map.insert(key, Some((le, live_until_ledger)), budget)?;
     }
 
@@ -1078,7 +1148,7 @@ fn build_storage_map_from_xdr_ledger_entries<T: AsRef<[u8]>, I: ExactSizeIterato
             storage_map = storage_map.insert(Rc::clone(k), None, budget)?;
         }
     }
-    Ok((storage_map, ttl_map, init_entry_xdr_sizes))
+    Ok((storage_map, init_entry_metadata))
 }
 
 impl Host {
