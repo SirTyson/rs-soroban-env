@@ -1,6 +1,8 @@
 use std::rc::Rc;
 
-use crate::host_object::{MemHostObjectType, MuxedScAddress};
+use crate::host_object::{
+    handle_to_index, is_relative_object_handle, MemHostObjectType, MuxedScAddress,
+};
 use crate::{
     budget::{AsBudget, DepthLimiter},
     crypto::metered_scalar::MeteredScalar,
@@ -264,10 +266,19 @@ impl Host {
     }
 
     pub(crate) fn host_map_to_scmap(&self, map: &HostMap) -> Result<ScMap, HostError> {
+        let objects = self.try_borrow_objects()?;
+        self.host_map_to_scmap_with_objects(map, objects.as_slice())
+    }
+
+    fn host_map_to_scmap_with_objects(
+        &self,
+        map: &HostMap,
+        objects: &[HostObject],
+    ) -> Result<ScMap, HostError> {
         let mut mv = Vec::<ScMapEntry>::with_metered_capacity(map.len(), self)?;
         for (k, v) in map.iter(self)? {
-            let key = self.from_host_val(*k)?;
-            let val = self.from_host_val(*v)?;
+            let key = self.from_host_val_with_objects(*k, objects)?;
+            let val = self.from_host_val_with_objects(*v, objects)?;
             mv.push(ScMapEntry { key, val });
         }
         Ok(ScMap(self.map_err(mv.try_into())?))
@@ -276,13 +287,25 @@ impl Host {
     // This function is almost identical to `host_map_to_scmap`, and should only
     // be used for creating the instance storage map.
     pub(crate) fn instance_storage_map_to_scmap(&self, map: &HostMap) -> Result<ScMap, HostError> {
+        let objects = self.try_borrow_objects()?;
+        self.instance_storage_map_to_scmap_with_objects(map, objects.as_slice())
+    }
+
+    fn instance_storage_map_to_scmap_with_objects(
+        &self,
+        map: &HostMap,
+        objects: &[HostObject],
+    ) -> Result<ScMap, HostError> {
         let mut mv = Vec::<ScMapEntry>::with_metered_capacity(map.len(), self)?;
         for (k, v) in map.iter(self)? {
             // This is the only difference point compared to `host_map_to_scmap`:
             // we convert the key according to the storage key conversion rules
             // instead of the general value conversion rules.
-            let key = self.from_host_val_for_storage(*k)?;
-            let val = self.from_host_val(*v)?;
+            *self.try_borrow_storage_key_conversion_active_mut()? = true;
+            let key_res = self.from_host_val_with_objects(*k, objects);
+            *self.try_borrow_storage_key_conversion_active_mut()? = false;
+            let key = key_res?;
+            let val = self.from_host_val_with_objects(*v, objects)?;
             mv.push(ScMapEntry { key, val });
         }
         Ok(ScMap(self.map_err(mv.try_into())?))
@@ -409,10 +432,16 @@ impl Host {
         // Metering of val conversion happens only if an object is encountered,
         // and is done inside `from_host_obj`.
         let _span = tracy_span!("Val to ScVal");
-        let scval = self.budget_cloned().with_limited_depth(|_| {
-            ScVal::try_from_val(self, &val)
-                .map_err(|cerr| self.error(cerr, "failed to convert host value to ScVal", &[val]))
-        })?;
+        let scval = if Object::try_from(val).is_ok() {
+            let objects = self.try_borrow_objects()?;
+            self.from_host_val_with_objects(val, objects.as_slice())?
+        } else {
+            self.budget_cloned().with_limited_depth(|_| {
+                ScVal::try_from_val(self, &val).map_err(|cerr| {
+                    self.error(cerr, "failed to convert host value to ScVal", &[val])
+                })
+            })?
+        };
         // This is a check of internal logical consistency: we came _from_ a Val
         // so the ScVal definitely should have been representable.
         self.check_val_representable_scval(&scval)?;
@@ -422,10 +451,16 @@ impl Host {
     pub(crate) fn from_host_val_for_storage(&self, val: Val) -> Result<ScVal, HostError> {
         let _span = tracy_span!("Val to ScVal");
         *self.try_borrow_storage_key_conversion_active_mut()? = true;
-        let scval_res = self.budget_cloned().with_limited_depth(|_| {
-            ScVal::try_from_val(self, &val)
-                .map_err(|cerr| self.error(cerr, "failed to convert host value to ScVal", &[val]))
-        });
+        let scval_res = if Object::try_from(val).is_ok() {
+            let objects = self.try_borrow_objects()?;
+            self.from_host_val_with_objects(val, objects.as_slice())
+        } else {
+            self.budget_cloned().with_limited_depth(|_| {
+                ScVal::try_from_val(self, &val).map_err(|cerr| {
+                    self.error(cerr, "failed to convert host value to ScVal", &[val])
+                })
+            })
+        };
         *self.try_borrow_storage_key_conversion_active_mut()? = false;
         let scval = scval_res?;
         self.check_val_representable_scval(&scval)?;
@@ -461,82 +496,138 @@ impl Host {
     }
 
     pub(crate) fn from_host_obj(&self, ob: impl Into<Object>) -> Result<ScValObject, HostError> {
+        let objects = self.try_borrow_objects()?;
+        self.from_host_obj_with_objects(ob, objects.as_slice())
+    }
+
+    fn from_host_val_with_objects(
+        &self,
+        val: Val,
+        objects: &[HostObject],
+    ) -> Result<ScVal, HostError> {
+        let scval = self.budget_cloned().with_limited_depth(|_| {
+            if let Ok(obj) = Object::try_from(val) {
+                Ok(ScVal::from(self.from_host_obj_with_objects(obj, objects)?))
+            } else {
+                ScVal::try_from_val(self, &val).map_err(|cerr| {
+                    self.error(cerr, "failed to convert host value to ScVal", &[val])
+                })
+            }
+        })?;
+        self.check_val_representable_scval(&scval)?;
+        Ok(scval)
+    }
+
+    fn visit_host_obj_with_objects<'a>(
+        &self,
+        obj: Object,
+        objects: &'a [HostObject],
+    ) -> Result<&'a HostObject, HostError> {
+        self.charge_budget(ContractCostType::VisitObject, None)?;
+        let handle: u32 = obj.get_handle();
+        if is_relative_object_handle(handle) {
+            Err(self.err(
+                ScErrorType::Object,
+                ScErrorCode::InternalError,
+                "looking up relative object",
+                &[Val::from_u32(handle).to_val()],
+            ))
+        } else if let Some(obj) = objects.get(handle_to_index(handle)) {
+            Ok(obj)
+        } else {
+            let obj_payload = obj.as_val().get_payload();
+            let payload_val = Val::try_from_val(self, &obj_payload)?;
+            Err(self.err(
+                ScErrorType::Value,
+                ScErrorCode::InvalidInput,
+                "unknown object reference",
+                &[payload_val],
+            ))
+        }
+    }
+
+    fn from_host_obj_with_objects(
+        &self,
+        ob: impl Into<Object>,
+        objects: &[HostObject],
+    ) -> Result<ScValObject, HostError> {
         unsafe {
             let objref: Object = ob.into();
-            self.visit_obj_untyped(objref, |ho| {
-                let val = match ho {
-                    HostObject::Vec(vv) => {
-                        Vec::<ScVal>::charge_bulk_init_cpy(vv.len() as u64, self)?;
-                        let sv = vv.iter().map(|e| self.from_host_val(*e)).collect::<Result<
-                            Vec<ScVal>,
-                            HostError,
-                        >>(
-                        )?;
-                        ScVal::Vec(Some(ScVec(self.map_err(sv.try_into())?)))
+            let ho = self.visit_host_obj_with_objects(objref, objects)?;
+            let val = match ho {
+                HostObject::Vec(vv) => {
+                    Vec::<ScVal>::charge_bulk_init_cpy(vv.len() as u64, self)?;
+                    let sv = vv
+                        .iter()
+                        .map(|e| self.from_host_val_with_objects(*e, objects))
+                        .collect::<Result<Vec<ScVal>, HostError>>()?;
+                    ScVal::Vec(Some(ScVec(self.map_err(sv.try_into())?)))
+                }
+                HostObject::Map(mm) => ScVal::Map(Some(self.host_map_to_scmap_with_objects(
+                    mm,
+                    objects,
+                )?)),
+                HostObject::U64(u) => {
+                    charge_shallow_copy::<u64>(1, self)?;
+                    ScVal::U64(*u)
+                }
+                HostObject::I64(i) => {
+                    charge_shallow_copy::<i64>(1, self)?;
+                    ScVal::I64(*i)
+                }
+                HostObject::TimePoint(tp) => ScVal::Timepoint(tp.metered_clone(self)?),
+                HostObject::Duration(d) => ScVal::Duration(d.metered_clone(self)?),
+                HostObject::U128(u) => {
+                    charge_shallow_copy::<u128>(1, self)?;
+                    ScVal::U128(UInt128Parts {
+                        hi: int128_helpers::u128_hi(*u),
+                        lo: int128_helpers::u128_lo(*u),
+                    })
+                }
+                HostObject::I128(i) => {
+                    charge_shallow_copy::<i128>(1, self)?;
+                    ScVal::I128(Int128Parts {
+                        hi: int128_helpers::i128_hi(*i),
+                        lo: int128_helpers::i128_lo(*i),
+                    })
+                }
+                HostObject::U256(u) => {
+                    charge_shallow_copy::<u128>(2, self)?;
+                    let (hi_hi, hi_lo, lo_hi, lo_lo) = u256_into_pieces(*u);
+                    ScVal::U256(UInt256Parts {
+                        hi_hi,
+                        hi_lo,
+                        lo_hi,
+                        lo_lo,
+                    })
+                }
+                HostObject::I256(i) => {
+                    charge_shallow_copy::<i128>(2, self)?;
+                    let (hi_hi, hi_lo, lo_hi, lo_lo) = i256_into_pieces(*i);
+                    ScVal::I256(Int256Parts {
+                        hi_hi,
+                        hi_lo,
+                        lo_hi,
+                        lo_lo,
+                    })
+                }
+                HostObject::Bytes(b) => ScVal::Bytes(b.metered_clone(self)?),
+                HostObject::String(s) => ScVal::String(s.metered_clone(self)?),
+                HostObject::Symbol(s) => ScVal::Symbol(s.metered_clone(self)?),
+                HostObject::Address(addr) => ScVal::Address(addr.metered_clone(self)?),
+                HostObject::MuxedAddress(addr) => {
+                    if *self.try_borrow_storage_key_conversion_active()? {
+                        return Err(self.err(
+                            ScErrorType::Storage,
+                            ScErrorCode::InvalidInput,
+                            "muxed addresses should not be used in the storage keys",
+                            &[objref.to_val()],
+                        ));
                     }
-                    HostObject::Map(mm) => ScVal::Map(Some(self.host_map_to_scmap(mm)?)),
-                    HostObject::U64(u) => {
-                        charge_shallow_copy::<u64>(1, self)?;
-                        ScVal::U64(*u)
-                    }
-                    HostObject::I64(i) => {
-                        charge_shallow_copy::<i64>(1, self)?;
-                        ScVal::I64(*i)
-                    }
-                    HostObject::TimePoint(tp) => ScVal::Timepoint(tp.metered_clone(self)?),
-                    HostObject::Duration(d) => ScVal::Duration(d.metered_clone(self)?),
-                    HostObject::U128(u) => {
-                        charge_shallow_copy::<u128>(1, self)?;
-                        ScVal::U128(UInt128Parts {
-                            hi: int128_helpers::u128_hi(*u),
-                            lo: int128_helpers::u128_lo(*u),
-                        })
-                    }
-                    HostObject::I128(i) => {
-                        charge_shallow_copy::<i128>(1, self)?;
-                        ScVal::I128(Int128Parts {
-                            hi: int128_helpers::i128_hi(*i),
-                            lo: int128_helpers::i128_lo(*i),
-                        })
-                    }
-                    HostObject::U256(u) => {
-                        charge_shallow_copy::<u128>(2, self)?;
-                        let (hi_hi, hi_lo, lo_hi, lo_lo) = u256_into_pieces(*u);
-                        ScVal::U256(UInt256Parts {
-                            hi_hi,
-                            hi_lo,
-                            lo_hi,
-                            lo_lo,
-                        })
-                    }
-                    HostObject::I256(i) => {
-                        charge_shallow_copy::<i128>(2, self)?;
-                        let (hi_hi, hi_lo, lo_hi, lo_lo) = i256_into_pieces(*i);
-                        ScVal::I256(Int256Parts {
-                            hi_hi,
-                            hi_lo,
-                            lo_hi,
-                            lo_lo,
-                        })
-                    }
-                    HostObject::Bytes(b) => ScVal::Bytes(b.metered_clone(self)?),
-                    HostObject::String(s) => ScVal::String(s.metered_clone(self)?),
-                    HostObject::Symbol(s) => ScVal::Symbol(s.metered_clone(self)?),
-                    HostObject::Address(addr) => ScVal::Address(addr.metered_clone(self)?),
-                    HostObject::MuxedAddress(addr) => {
-                        if *self.try_borrow_storage_key_conversion_active()? {
-                            return Err(self.err(
-                                ScErrorType::Storage,
-                                ScErrorCode::InvalidInput,
-                                "muxed addresses should not be used in the storage keys",
-                                &[objref.to_val()],
-                            ));
-                        }
-                        ScVal::Address(addr.0.metered_clone(self)?)
-                    }
-                };
-                Ok(ScValObject::unchecked_from_val(val))
-            })
+                    ScVal::Address(addr.0.metered_clone(self)?)
+                }
+            };
+            Ok(ScValObject::unchecked_from_val(val))
         }
     }
 
