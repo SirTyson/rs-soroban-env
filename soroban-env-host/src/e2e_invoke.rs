@@ -2,7 +2,10 @@
 /// environments using a clean host instance.
 /// Also contains helpers for processing the ledger changes caused by these
 /// host functions.
-use std::{cmp::max, rc::Rc};
+use std::{
+    cmp::{max, Ordering},
+    rc::Rc,
+};
 
 #[cfg(any(test, feature = "recording_mode"))]
 use crate::{
@@ -28,7 +31,7 @@ use crate::{
         LedgerKeyAccount, LedgerKeyContractCode, LedgerKeyContractData, LedgerKeyTrustLine,
         ScErrorCode, ScErrorType, SorobanAuthorizationEntry, SorobanResources, TtlEntry,
     },
-    DiagnosticLevel, Error, Host, HostError, LedgerInfo, MeteredOrdMap,
+    Compare, DiagnosticLevel, Error, Host, HostError, LedgerInfo, MeteredOrdMap,
 };
 use crate::{ledger_info::get_key_durability, ModuleCache};
 use crate::{storage::EntryWithLiveUntil, vm::wasm_module_memory_cost};
@@ -37,6 +40,65 @@ use sha2::{Digest, Sha256};
 
 type TtlEntryMap = MeteredOrdMap<Rc<LedgerKey>, Rc<TtlEntry>, Budget>;
 type RestoredKeySet = MeteredOrdMap<Rc<LedgerKey>, (), Budget>;
+
+fn sort_ledger_key_pairs<V>(
+    budget: &Budget,
+    entries: &mut [(Rc<LedgerKey>, V)],
+) -> Result<(), HostError> {
+    let mut comparison_error = None;
+    entries.sort_by(|(a, _), (b, _)| match budget.compare(a, b) {
+        Ok(ordering) => ordering,
+        Err(err) => {
+            if comparison_error.is_none() {
+                comparison_error = Some(err);
+            }
+            Ordering::Equal
+        }
+    });
+    if let Some(err) = comparison_error {
+        Err(err)
+    } else {
+        Ok(())
+    }
+}
+
+fn sort_ledger_key_pairs_and_keep_last_value<V>(
+    budget: &Budget,
+    entries: &mut Vec<(Rc<LedgerKey>, V)>,
+) -> Result<(), HostError> {
+    sort_ledger_key_pairs(budget, entries)?;
+
+    let mut write_pos = 0;
+    for read_pos in 0..entries.len() {
+        if read_pos + 1 < entries.len()
+            && budget.compare(&entries[read_pos].0, &entries[read_pos + 1].0)?
+                == Ordering::Equal
+        {
+            continue;
+        }
+        if write_pos != read_pos {
+            entries.swap(write_pos, read_pos);
+        }
+        write_pos += 1;
+    }
+    entries.truncate(write_pos);
+    Ok(())
+}
+
+fn build_metered_ledger_key_map<V>(
+    budget: &Budget,
+    mut entries: Vec<(Rc<LedgerKey>, V)>,
+) -> Result<MeteredOrdMap<Rc<LedgerKey>, V, Budget>, HostError>
+where
+    V: MeteredClone,
+{
+    if entries.is_empty() {
+        return Ok(MeteredOrdMap::new());
+    }
+    sort_ledger_key_pairs_and_keep_last_value(budget, &mut entries)?;
+    entries.charge_deep_clone(budget)?;
+    MeteredOrdMap::from_map(entries, budget)
+}
 
 /// Result of invoking a single host function prepared for embedder consumption.
 pub struct InvokeHostFunctionResult {
@@ -934,25 +996,27 @@ fn build_storage_footprint_from_xdr(
     budget: &Budget,
     footprint: LedgerFootprint,
 ) -> Result<Footprint, HostError> {
-    let mut footprint_map = FootprintMap::new();
+    let read_write = footprint.read_write.as_vec();
+    let read_only = footprint.read_only.as_vec();
+    let mut footprint_entries: Vec<(Rc<LedgerKey>, AccessType)> =
+        Vec::with_capacity(read_write.len().saturating_add(read_only.len()));
 
-    for key in footprint.read_write.as_vec() {
+    for key in read_write {
         Storage::check_supported_ledger_key_type(&key)?;
-        footprint_map = footprint_map.insert(
+        footprint_entries.push((
             Rc::metered_new(key.metered_clone(budget)?, budget)?,
             AccessType::ReadWrite,
-            budget,
-        )?;
+        ));
     }
 
-    for key in footprint.read_only.as_vec() {
+    for key in read_only {
         Storage::check_supported_ledger_key_type(&key)?;
-        footprint_map = footprint_map.insert(
+        footprint_entries.push((
             Rc::metered_new(key.metered_clone(budget)?, budget)?,
             AccessType::ReadOnly,
-            budget,
-        )?;
+        ));
     }
+    let footprint_map: FootprintMap = build_metered_ledger_key_map(budget, footprint_entries)?;
     Ok(Footprint(footprint_map))
 }
 
@@ -964,14 +1028,16 @@ fn build_storage_map_from_xdr_ledger_entries<T: AsRef<[u8]>, I: ExactSizeIterato
     ledger_num: u32,
     #[cfg(any(test, feature = "recording_mode"))] is_recording_mode: bool,
 ) -> Result<(StorageMap, TtlEntryMap), HostError> {
-    let mut storage_map = StorageMap::new();
-    let mut ttl_map = TtlEntryMap::new();
-
     if encoded_ledger_entries.len() != encoded_ttl_entries.len() {
         return Err(
             Error::from_type_and_code(ScErrorType::Storage, ScErrorCode::InternalError).into(),
         );
     }
+
+    let mut storage_entries: Vec<(Rc<LedgerKey>, Option<EntryWithLiveUntil>)> =
+        Vec::with_capacity(footprint.0.len());
+    let mut ttl_entries: Vec<(Rc<LedgerKey>, Rc<TtlEntry>)> =
+        Vec::with_capacity(encoded_ttl_entries.len());
 
     for (entry_buf, ttl_buf) in encoded_ledger_entries.zip(encoded_ttl_entries) {
         let mut live_until_ledger: Option<u32> = None;
@@ -1022,7 +1088,7 @@ fn build_storage_map_from_xdr_ledger_entries<T: AsRef<[u8]>, I: ExactSizeIterato
 
             live_until_ledger = Some(ttl_entry.live_until_ledger_seq);
 
-            ttl_map = ttl_map.insert(key.clone(), ttl_entry, budget)?;
+            ttl_entries.push((key.clone(), ttl_entry));
         } else if matches!(le.as_ref().data, LedgerEntryData::ContractData(_))
             || matches!(le.as_ref().data, LedgerEntryData::ContractCode(_))
         {
@@ -1038,17 +1104,34 @@ fn build_storage_map_from_xdr_ledger_entries<T: AsRef<[u8]>, I: ExactSizeIterato
                 ScErrorType::Storage,
                 ScErrorCode::InternalError,
             )
-            .into());
+                .into());
         }
-        storage_map = storage_map.insert(key, Some((le, live_until_ledger)), budget)?;
+        storage_entries.push((key, Some((le, live_until_ledger))));
     }
 
     // Add non-existing entries from the footprint to the storage.
+    sort_ledger_key_pairs_and_keep_last_value(budget, &mut storage_entries)?;
+    let existing_storage_entries = storage_entries.len();
+    let mut storage_entry_pos = 0;
     for k in footprint.0.keys(budget)? {
-        if !storage_map.contains_key::<LedgerKey>(k, budget)? {
-            storage_map = storage_map.insert(Rc::clone(k), None, budget)?;
+        let mut found = false;
+        while storage_entry_pos < existing_storage_entries {
+            match budget.compare(&storage_entries[storage_entry_pos].0, k)? {
+                Ordering::Less => storage_entry_pos += 1,
+                Ordering::Equal => {
+                    found = true;
+                    storage_entry_pos += 1;
+                    break;
+                }
+                Ordering::Greater => break,
+            }
+        }
+        if !found {
+            storage_entries.push((Rc::clone(k), None));
         }
     }
+    let storage_map: StorageMap = build_metered_ledger_key_map(budget, storage_entries)?;
+    let ttl_map: TtlEntryMap = build_metered_ledger_key_map(budget, ttl_entries)?;
     Ok((storage_map, ttl_map))
 }
 
