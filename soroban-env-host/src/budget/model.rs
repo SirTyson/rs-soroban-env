@@ -113,6 +113,23 @@ impl TryFrom<ContractCostParamEntry> for MeteredCostComponent {
     }
 }
 
+impl MeteredCostComponent {
+    #[inline]
+    pub(crate) fn evaluate_one(&self, input: Option<u64>) -> u64 {
+        match input {
+            Some(input) => {
+                let mut res = self.const_term;
+                if !self.lin_term.is_zero() {
+                    let lin_cost = self.lin_term.saturating_mul(input);
+                    res = res.saturating_add(lin_cost.unscale())
+                }
+                res
+            }
+            None => self.const_term,
+        }
+    }
+}
+
 impl HostCostModel for MeteredCostComponent {
     fn evaluate(&self, iterations: u64, input: Option<u64>) -> Result<u64, HostError> {
         let const_term = self.const_term.saturating_mul(iterations);

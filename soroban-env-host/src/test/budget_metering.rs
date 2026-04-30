@@ -235,6 +235,101 @@ fn metered_xdr_out_of_budget() -> Result<(), HostError> {
 }
 
 #[test]
+fn budget_charge_one_exact_accounting_and_failures() -> Result<(), HostError> {
+    let host = Host::test_host_with_prng()
+        .test_budget(1000, 1000)
+        .enable_model(ContractCostType::VisitObject, 7, 0, 11, 0)
+        .enable_model(ContractCostType::MemCpy, 5, 3, 7, 2);
+
+    host.as_budget()
+        .charge(ContractCostType::VisitObject, None)?;
+    let visit_tracker = host
+        .as_budget()
+        .get_tracker(ContractCostType::VisitObject)?;
+    assert_eq!(visit_tracker.iterations, 1);
+    assert_eq!(visit_tracker.inputs, None);
+    assert_eq!(visit_tracker.cpu, 7);
+    assert_eq!(visit_tracker.mem, 11);
+
+    host.as_budget().charge(ContractCostType::MemCpy, Some(4))?;
+    let memcpy_tracker = host.as_budget().get_tracker(ContractCostType::MemCpy)?;
+    assert_eq!(memcpy_tracker.iterations, 1);
+    assert_eq!(memcpy_tracker.inputs, Some(4));
+    assert_eq!(memcpy_tracker.cpu, 17);
+    assert_eq!(memcpy_tracker.mem, 15);
+    assert_eq!(host.as_budget().get_cpu_insns_consumed()?, 24);
+    assert_eq!(host.as_budget().get_mem_bytes_consumed()?, 26);
+
+    let host = Host::test_host_with_prng()
+        .test_budget(1000, 1000)
+        .enable_model(ContractCostType::VisitObject, 7, 0, 11, 0);
+    let res = host
+        .as_budget()
+        .charge(ContractCostType::VisitObject, Some(1));
+    assert!(HostError::result_matches_err(
+        res,
+        (ScErrorType::Budget, ScErrorCode::InternalError)
+    ));
+    let visit_tracker = host
+        .as_budget()
+        .get_tracker(ContractCostType::VisitObject)?;
+    assert_eq!(visit_tracker.iterations, 1);
+    assert_eq!(visit_tracker.cpu, 0);
+    assert_eq!(visit_tracker.mem, 0);
+    assert_eq!(host.as_budget().get_cpu_insns_consumed()?, 0);
+    assert_eq!(host.as_budget().get_mem_bytes_consumed()?, 0);
+
+    let host = Host::test_host_with_prng()
+        .test_budget(6, 1000)
+        .enable_model(ContractCostType::VisitObject, 7, 0, 11, 0);
+    let res = host.as_budget().charge(ContractCostType::VisitObject, None);
+    assert!(HostError::result_matches_err(
+        res,
+        (ScErrorType::Budget, ScErrorCode::ExceededLimit)
+    ));
+    let visit_tracker = host
+        .as_budget()
+        .get_tracker(ContractCostType::VisitObject)?;
+    assert_eq!(visit_tracker.cpu, 7);
+    assert_eq!(visit_tracker.mem, 0);
+    assert_eq!(host.as_budget().get_cpu_insns_consumed()?, 7);
+    assert_eq!(host.as_budget().get_mem_bytes_consumed()?, 0);
+
+    let host = Host::test_host_with_prng()
+        .test_budget(1000, 10)
+        .enable_model(ContractCostType::VisitObject, 7, 0, 11, 0);
+    let res = host.as_budget().charge(ContractCostType::VisitObject, None);
+    assert!(HostError::result_matches_err(
+        res,
+        (ScErrorType::Budget, ScErrorCode::ExceededLimit)
+    ));
+    let visit_tracker = host
+        .as_budget()
+        .get_tracker(ContractCostType::VisitObject)?;
+    assert_eq!(visit_tracker.cpu, 7);
+    assert_eq!(visit_tracker.mem, 11);
+    assert_eq!(host.as_budget().get_cpu_insns_consumed()?, 7);
+    assert_eq!(host.as_budget().get_mem_bytes_consumed()?, 11);
+
+    let host = Host::test_host_with_prng()
+        .test_budget(1000, 1000)
+        .enable_model(ContractCostType::MemCpy, 5, 3, 7, 2);
+    host.as_budget().with_observable_shadow_mode(|| {
+        host.as_budget().charge(ContractCostType::MemCpy, Some(4))
+    })?;
+    let memcpy_tracker = host.as_budget().get_tracker(ContractCostType::MemCpy)?;
+    assert_eq!(memcpy_tracker.iterations, 0);
+    assert_eq!(memcpy_tracker.cpu, 0);
+    assert_eq!(memcpy_tracker.mem, 0);
+    assert_eq!(host.as_budget().get_cpu_insns_consumed()?, 0);
+    assert_eq!(host.as_budget().get_mem_bytes_consumed()?, 0);
+    assert_eq!(host.as_budget().get_shadow_cpu_insns_consumed()?, 17);
+    assert_eq!(host.as_budget().get_shadow_mem_bytes_consumed()?, 15);
+
+    Ok(())
+}
+
+#[test]
 fn map_insert_key_vec_obj() -> Result<(), HostError> {
     let mut host = Host::test_host_with_prng().test_budget(1000, 1000);
     let mut m = host.map_new()?;

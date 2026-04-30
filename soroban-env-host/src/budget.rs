@@ -239,6 +239,10 @@ impl BudgetImpl {
         iterations: u64,
         input: Option<u64>,
     ) -> Result<(), HostError> {
+        if iterations == 1 {
+            return self.charge_one(ty, input);
+        }
+
         let tracker = self
             .tracker
             .cost_trackers
@@ -284,6 +288,52 @@ impl BudgetImpl {
             .check_budget_limit(IsShadowMode(self.is_in_shadow_mode))
     }
 
+    #[inline]
+    pub fn charge_one(
+        &mut self,
+        ty: ContractCostType,
+        input: Option<u64>,
+    ) -> Result<(), HostError> {
+        let idx = ty as usize;
+        debug_assert!(idx < ContractCostType::variants().len());
+        let tracker = &mut self.tracker.cost_trackers[idx];
+
+        if !self.is_in_shadow_mode {
+            // Update tracker for reporting. Preserve the existing side-effect
+            // order: meter count and iterations are recorded before input-shape
+            // validation can fail.
+            self.tracker.meter_count = self.tracker.meter_count.saturating_add(1);
+            tracker.iterations = tracker.iterations.saturating_add(1);
+            match (&mut tracker.inputs, input) {
+                (None, None) => (),
+                (Some(t), Some(i)) => *t = t.saturating_add(i),
+                // internal logic error, a wrong cost type has been passed in
+                _ => return Err((ScErrorType::Budget, ScErrorCode::InternalError).into()),
+            };
+        }
+
+        let cpu_charged =
+            self.cpu_insns
+                .charge_one(ty, input, IsCpu(true), IsShadowMode(self.is_in_shadow_mode));
+        if !self.is_in_shadow_mode {
+            tracker.cpu = tracker.cpu.saturating_add(cpu_charged);
+        }
+        self.cpu_insns
+            .check_budget_limit(IsShadowMode(self.is_in_shadow_mode))?;
+
+        let mem_charged = self.mem_bytes.charge_one(
+            ty,
+            input,
+            IsCpu(false),
+            IsShadowMode(self.is_in_shadow_mode),
+        );
+        if !self.is_in_shadow_mode {
+            tracker.mem = tracker.mem.saturating_add(mem_charged);
+        }
+        self.mem_bytes
+            .check_budget_limit(IsShadowMode(self.is_in_shadow_mode))
+    }
+
     /// Batched equivalent of repeated single-leaf `ValSer` charges grouped by
     /// input length. For each `(input_len, count)` bucket, the per-leaf CPU and
     /// memory amounts are computed via `evaluate(1, Some(input_len))` and then
@@ -293,10 +343,7 @@ impl BudgetImpl {
     /// match what would have been recorded by `count` separate single-leaf
     /// charges of the same length, so cost-model totals and budget-limit
     /// outcomes remain bit-identical to the unbatched path.
-    pub(crate) fn charge_val_ser_batched(
-        &mut self,
-        hist: &[(u64, u64)],
-    ) -> Result<(), HostError> {
+    pub(crate) fn charge_val_ser_batched(&mut self, hist: &[(u64, u64)]) -> Result<(), HostError> {
         let ty = ContractCostType::ValSer;
 
         let mut total_count: u64 = 0;
@@ -1400,7 +1447,7 @@ impl Budget {
     /// Otherwise it is a linear model.  The caller needs to ensure the input
     /// passed is consistent with the inherent model underneath.
     pub fn charge(&self, ty: ContractCostType, input: Option<u64>) -> Result<(), HostError> {
-        self.0.try_borrow_mut_or_err()?.charge(ty, 1, input)
+        self.0.try_borrow_mut_or_err()?.charge_one(ty, input)
     }
 
     /// Batched `ValSer` charge keyed by `(input_len, count)` pairs. Equivalent
@@ -1410,13 +1457,8 @@ impl Budget {
     /// single mutable borrow of the budget. Used by `metered_write_xdr` to
     /// remove per-chunk metering overhead from the XDR encoder hot path while
     /// preserving observable budget totals exactly.
-    pub(crate) fn charge_val_ser_batched(
-        &self,
-        hist: &[(u64, u64)],
-    ) -> Result<(), HostError> {
-        self.0
-            .try_borrow_mut_or_err()?
-            .charge_val_ser_batched(hist)
+    pub(crate) fn charge_val_ser_batched(&self, hist: &[(u64, u64)]) -> Result<(), HostError> {
+        self.0.try_borrow_mut_or_err()?.charge_val_ser_batched(hist)
     }
 
     pub(crate) fn get_memory_cost(

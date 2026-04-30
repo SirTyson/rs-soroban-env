@@ -5,7 +5,9 @@ use core::fmt::Debug;
 
 /// Helper types to annotate boolean function arguments
 #[allow(dead_code)]
+#[derive(Clone, Copy)]
 pub(crate) struct IsCpu(pub(crate) bool);
+#[derive(Clone, Copy)]
 pub(crate) struct IsShadowMode(pub(crate) bool);
 
 #[derive(Clone)]
@@ -152,6 +154,34 @@ impl BudgetDimension {
         } else {
             Ok(())
         }
+    }
+
+    #[inline]
+    pub(crate) fn charge_one(
+        &mut self,
+        ty: ContractCostType,
+        input: Option<u64>,
+        _is_cpu: IsCpu,
+        is_shadow: IsShadowMode,
+    ) -> u64 {
+        let idx = ty as usize;
+        debug_assert!(idx < self.cost_models.len());
+        let amount = self.cost_models[idx].evaluate_one(input);
+
+        #[cfg(all(not(target_family = "wasm"), feature = "tracy"))]
+        if _is_cpu.0 {
+            let _span = tracy_span!("charge");
+            _span.emit_text(ty.name());
+            _span.emit_value(amount);
+        }
+
+        if is_shadow.0 {
+            self.shadow_total_count = self.shadow_total_count.saturating_add(amount);
+        } else {
+            self.total_count = self.total_count.saturating_add(amount);
+        }
+
+        amount
     }
 
     /// Performs a bulk charge to the budget under the specified `CostType`.
