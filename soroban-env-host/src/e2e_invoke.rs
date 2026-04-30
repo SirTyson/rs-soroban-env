@@ -369,9 +369,9 @@ fn get_ledger_changes(
     Ok(changes)
 }
 
-/// Returns ledger changes for enforcing-mode invocation using vectors that are
-/// aligned by construction with the immutable footprint/storage key order.
-fn get_enforcing_ledger_changes(
+/// Returns ledger changes using vectors that are aligned by construction with
+/// the immutable footprint/storage key order.
+fn get_aligned_ledger_changes(
     budget: &Budget,
     storage: &Storage,
     init_storage_snapshot: &InitialStorageSnapshot,
@@ -687,7 +687,7 @@ pub fn invoke_host_function<T: AsRef<[u8]>, I: ExactSizeIterator<Item = T>>(
         metered_write_xdr(&budget, &res, &mut encoded_result_sc_val).map(|_| encoded_result_sc_val)
     });
     if encoded_invoke_result.is_ok() {
-        let ledger_changes = get_enforcing_ledger_changes(
+        let ledger_changes = get_aligned_ledger_changes(
             &budget,
             &storage,
             &init_storage_snapshot,
@@ -909,7 +909,14 @@ pub fn invoke_host_function_in_recording_mode(
         }
     }
 
-    let (footprint, disk_read_bytes, init_ttl_map, restored_rw_entry_ids, restored_keys) = host
+    let (
+        footprint,
+        disk_read_bytes,
+        init_storage_snapshot,
+        init_ttl_map,
+        restored_rw_entry_ids,
+        restored_keys,
+    ) = host
         .with_mut_storage(|storage| {
             let footprint = storage_footprint_to_ledger_footprint(&storage.footprint)?;
             let _footprint_from_xdr = build_storage_footprint_from_xdr(&budget, footprint.clone())?;
@@ -973,7 +980,7 @@ pub fn invoke_host_function_in_recording_mode(
                     current_rw_id += 1;
                 }
             }
-            let (_init_storage, _init_storage_snapshot, init_ttl_map) =
+            let (_init_storage, init_storage_snapshot, init_ttl_map) =
                 build_storage_map_from_xdr_ledger_entries(
                 &budget,
                 &storage.footprint,
@@ -985,6 +992,7 @@ pub fn invoke_host_function_in_recording_mode(
             Ok((
                 footprint,
                 disk_read_bytes,
+                init_storage_snapshot,
                 init_ttl_map,
                 restored_rw_entry_ids,
                 restored_keys,
@@ -1008,15 +1016,29 @@ pub fn invoke_host_function_in_recording_mode(
         Some(restored_keys)
     };
     let (ledger_changes, contract_events) = if invoke_result.is_ok() {
-        let mut ledger_changes = get_ledger_changes(
-            &budget,
-            &storage,
-            &*ledger_snapshot,
-            init_ttl_map,
-            min_live_until_ledger,
-            &restored_keys,
-            ledger_seq,
-        )?;
+        let mut ledger_changes =
+            if storage.map.len() == storage.footprint.0.len()
+                && storage.map.len() == init_storage_snapshot.len()
+            {
+                get_aligned_ledger_changes(
+                    &budget,
+                    &storage,
+                    &init_storage_snapshot,
+                    min_live_until_ledger,
+                    &restored_keys,
+                    ledger_seq,
+                )?
+            } else {
+                get_ledger_changes(
+                    &budget,
+                    &storage,
+                    &*ledger_snapshot,
+                    init_ttl_map,
+                    min_live_until_ledger,
+                    &restored_keys,
+                    ledger_seq,
+                )?
+            };
         // Add the keys that only exist in the footprint, but not in the
         // storage. This doesn't resemble anything in the enforcing mode, so use
         // the shadow budget for this.

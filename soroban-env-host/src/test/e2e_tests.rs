@@ -58,7 +58,7 @@ use std::rc::Rc;
 // real_instructions <= (1 + RECORDING_MODE_INSTRUCTIONS_RANGE) * estimated_instructions
 // and
 // estimated_instructions <= real_instructions * (1 + RECORDING_MODE_INSTRUCTIONS_RANGE)
-const RECORDING_MODE_INSTRUCTIONS_RANGE: f64 = 0.021;
+const RECORDING_MODE_INSTRUCTIONS_RANGE: f64 = 0.02;
 
 fn prng_seed() -> [u8; 32] {
     [0; 32]
@@ -841,7 +841,7 @@ fn test_wasm_upload_success_in_recording_mode() {
         }]
     );
     assert!(res.auth.is_empty());
-    expect!["1766816"].assert_eq(&res.resources.instructions.to_string());
+    expect!["1766673"].assert_eq(&res.resources.instructions.to_string());
     expect!["684"].assert_eq(&res.resources.write_bytes.to_string());
     assert_eq!(
         res.resources,
@@ -1397,7 +1397,7 @@ fn test_create_contract_success_in_recording_mode() {
         ]
     );
     assert_eq!(res.auth, vec![cd.auth_entry]);
-    expect!["637223"].assert_eq(&res.resources.instructions.to_string());
+    expect!["636738"].assert_eq(&res.resources.instructions.to_string());
     expect!["104"].assert_eq(&res.resources.write_bytes.to_string());
     assert_eq!(
         res.resources,
@@ -1535,7 +1535,7 @@ fn test_create_contract_success_in_recording_mode_with_custom_account() {
         ]
     );
     assert_eq!(res.auth, vec![cd.auth_entry]);
-    expect!["1037577"].assert_eq(&res.resources.instructions.to_string());
+    expect!["1035751"].assert_eq(&res.resources.instructions.to_string());
     expect!["176"].assert_eq(&res.resources.write_bytes.to_string());
     assert_eq!(
         res.resources,
@@ -1606,7 +1606,7 @@ fn test_create_contract_success_in_recording_mode_with_enforced_auth() {
         ]
     );
     assert_eq!(res.auth, vec![cd.auth_entry]);
-    expect!["638710"].assert_eq(&res.resources.instructions.to_string());
+    expect!["638225"].assert_eq(&res.resources.instructions.to_string());
     expect!["104"].assert_eq(&res.resources.write_bytes.to_string());
     assert_eq!(
         res.resources,
@@ -2045,7 +2045,7 @@ fn test_invoke_contract_with_storage_ops_success_in_recording_mode() {
         ]
     );
     assert!(res.restored_rw_entry_ids.is_empty());
-    expect!["786251"].assert_eq(&res.resources.instructions.to_string());
+    expect!["785227"].assert_eq(&res.resources.instructions.to_string());
     expect!["80"].assert_eq(&res.resources.write_bytes.to_string());
     assert_eq!(
         res.resources,
@@ -2112,7 +2112,7 @@ fn test_invoke_contract_with_storage_ops_success_in_recording_mode() {
             wasm_entry_change.clone()
         ]
     );
-    expect!["897069"].assert_eq(&extend_res.resources.instructions.to_string());
+    expect!["895860"].assert_eq(&extend_res.resources.instructions.to_string());
     assert_eq!(
         extend_res.resources,
         SorobanResources {
@@ -2412,7 +2412,7 @@ fn test_auto_restore_with_extension_in_recording_mode() {
         ]
     );
 
-    expect!["1556789"].assert_eq(&res.resources.instructions.to_string());
+    expect!["1555580"].assert_eq(&res.resources.instructions.to_string());
     assert_eq!(
         res.resources,
         SorobanResources {
@@ -2555,7 +2555,7 @@ fn test_auto_restore_with_overwrite_in_recording_mode() {
         ]
     );
 
-    expect!["915553"].assert_eq(&res.resources.instructions.to_string());
+    expect!["914344"].assert_eq(&res.resources.instructions.to_string());
     assert_eq!(
         res.resources,
         SorobanResources {
@@ -2695,7 +2695,7 @@ fn test_auto_restore_with_new_entry_in_recording_mode() {
         ]
     );
     let wasm_entry_size = cd.wasm_entry.to_xdr(Limits::none()).unwrap().len() as u32;
-    expect!["1439385"].assert_eq(&res.resources.instructions.to_string());
+    expect!["1438361"].assert_eq(&res.resources.instructions.to_string());
     assert_eq!(
         res.resources,
         SorobanResources {
@@ -2832,7 +2832,7 @@ fn test_auto_restore_with_expired_temp_entry_in_recording_mode() {
         ]
     );
 
-    expect!["1556730"].assert_eq(&res.resources.instructions.to_string());
+    expect!["1552708"].assert_eq(&res.resources.instructions.to_string());
     assert_eq!(
         res.resources,
         SorobanResources {
@@ -2955,7 +2955,7 @@ fn test_auto_restore_with_recreated_temp_entry_in_recording_mode() {
         ]
     );
 
-    expect!["1558903"].assert_eq(&res.resources.instructions.to_string());
+    expect!["1554881"].assert_eq(&res.resources.instructions.to_string());
     assert_eq!(
         res.resources,
         SorobanResources {
