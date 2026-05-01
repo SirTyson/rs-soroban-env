@@ -206,6 +206,10 @@ pub struct AuthorizationManager {
     // Contract authorizations are always enforced independently of the `mode`,
     // as they are self-contained and fully defined by the contract logic.
     invoker_contract_trackers: RefCell<Vec<InvokerContractAuthorizationTracker>>,
+    // Undo records for enforcing-mode tracker mutations. These let frame
+    // rollback restore auth state without eagerly materializing a full snapshot
+    // for frames that usually succeed.
+    undo_log: RefCell<Vec<AuthUndoEntry>>,
     // Call stack of relevant host function and contract invocations, moves mostly
     // in lock step with context stack in the host.
     call_stack: RefCell<Vec<AuthStackFrame>>,
@@ -277,24 +281,51 @@ pub struct RecordedAuthPayload {
 // Snapshot of `AuthorizationManager` to use when performing the callstack
 // rollbacks.
 pub struct AuthorizationManagerSnapshot {
-    account_trackers_snapshot: AccountTrackersSnapshot,
-    invoker_contract_tracker_root_snapshots: Vec<AuthorizedInvocationSnapshot>,
+    state: AuthorizationManagerSnapshotState,
     #[cfg(any(test, feature = "recording_mode"))]
     tracker_by_address_handle: Option<BTreeMap<u32, usize>>,
 }
 
-// Snapshot of the `account_trackers` in `AuthorizationManager`.
-enum AccountTrackersSnapshot {
-    // In enforcing mode we only need to snapshot the mutable part of the
-    // trackers.
-    // `None` means that the tracker is currently in authentication process and
-    // shouldn't be modified (as the tracker can't be used to authenticate
-    // itself).
-    Enforcing(Vec<Option<AccountAuthorizationTrackerSnapshot>>),
+enum AuthorizationManagerSnapshotState {
+    Enforcing(EnforcingAuthorizationManagerSnapshot),
     // In recording mode snapshot the whole vector, as we create trackers
-    // lazily and hence the outer vector itself might change.
+    // lazily and hence the outer vector itself might change. Invoker-contract
+    // trackers still use the old full tree snapshots in recording mode.
     #[cfg(any(test, feature = "recording_mode"))]
-    Recording(Vec<RefCell<AccountAuthorizationTracker>>),
+    Recording {
+        account_trackers: Vec<RefCell<AccountAuthorizationTracker>>,
+        invoker_contract_tracker_root_snapshots: Vec<AuthorizedInvocationSnapshot>,
+    },
+}
+
+struct EnforcingAuthorizationManagerSnapshot {
+    undo_log_len: usize,
+    invoker_contract_trackers_len: usize,
+}
+
+#[derive(Clone)]
+enum AuthTrackerRef {
+    Account(usize),
+    InvokerContract(usize),
+}
+
+#[derive(Clone)]
+struct InvocationMutation {
+    path: Vec<usize>,
+    root_exhausted_frame: Option<usize>,
+    is_fully_processed: bool,
+}
+
+#[derive(Clone)]
+enum AuthUndoEntry {
+    Invocation {
+        tracker: AuthTrackerRef,
+        mutation: InvocationMutation,
+    },
+    AccountVerified {
+        tracker_index: usize,
+        verified: bool,
+    },
 }
 
 // Additional AuthorizationManager fields needed only for the recording mode.
@@ -428,7 +459,7 @@ struct InvocationTracker {
     // logic error somewhere.
     match_stack: Vec<MatchState>,
     // If root invocation is exhausted, the index of the stack frame where it
-    // was exhausted (i.e. index in `match_stack`).
+    // was exhausted.
     root_exhausted_frame: Option<usize>,
     // Indicates whether this tracker is fully processed, i.e. the authorized
     // root frame has been exhausted and then popped from the stack.
@@ -740,6 +771,30 @@ impl AuthorizedInvocation {
         })
     }
 
+    // metering: covered
+    fn charge_snapshot_metering(&self, budget: &Budget) -> Result<(), HostError> {
+        <Result<Vec<AuthorizedInvocationSnapshot>, HostError> as MeteredContainer>::charge_bulk_init_cpy(
+            self.sub_invocations.len() as u64,
+            budget,
+        )?;
+        for sub in self.sub_invocations.iter() {
+            sub.charge_snapshot_metering(budget)?;
+        }
+        Ok(())
+    }
+
+    // metering: free
+    fn get_mut_at_path(&mut self, path: &[usize]) -> Result<&mut AuthorizedInvocation, HostError> {
+        let mut invocation = self;
+        for index in path.iter() {
+            invocation = invocation
+                .sub_invocations
+                .get_mut(*index)
+                .ok_or((ScErrorType::Auth, ScErrorCode::InternalError))?;
+        }
+        Ok(invocation)
+    }
+
     // metering: free
     fn rollback(&mut self, snapshot: &AuthorizedInvocationSnapshot) -> Result<(), HostError> {
         self.is_exhausted = snapshot.is_exhausted;
@@ -787,6 +842,7 @@ impl AuthorizationManager {
             call_stack: RefCell::new(vec![]),
             account_trackers: RefCell::new(trackers),
             invoker_contract_trackers: RefCell::new(vec![]),
+            undo_log: RefCell::new(vec![]),
         })
     }
 
@@ -800,6 +856,7 @@ impl AuthorizationManager {
             call_stack: RefCell::new(vec![]),
             account_trackers: RefCell::new(vec![]),
             invoker_contract_trackers: RefCell::new(vec![]),
+            undo_log: RefCell::new(vec![]),
         }
     }
 
@@ -817,6 +874,7 @@ impl AuthorizationManager {
             call_stack: RefCell::new(vec![]),
             account_trackers: RefCell::new(vec![]),
             invoker_contract_trackers: RefCell::new(vec![]),
+            undo_log: RefCell::new(vec![]),
         }
     }
 
@@ -915,7 +973,7 @@ impl AuthorizationManager {
         // stack. Note, that invoker contract trackers consider the direct frame
         // to never require auth (any `require_auth` calls would be matched by
         // logic above).
-        for tracker in invoker_contract_trackers.iter_mut() {
+        for (tracker_index, tracker) in invoker_contract_trackers.iter_mut().enumerate() {
             // Skip trackers created by the current contract — invoker
             // contract auth is for authorizing sub-contract calls, a
             // contract cannot use it to authorize itself.
@@ -925,7 +983,12 @@ impl AuthorizationManager {
                 }
             }
             if host.compare(&tracker.contract_address, &address)?.is_eq()
-                && tracker.maybe_authorize_invocation(host, function)?
+                && tracker.maybe_authorize_invocation(
+                    host,
+                    function,
+                    tracker_index,
+                    &self.undo_log,
+                )?
             {
                 return Ok(true);
             }
@@ -962,7 +1025,7 @@ impl AuthorizationManager {
 
         // Iterate all the trackers and try to find one that
         // fulfills the authorization requirement.
-        for tracker in self.try_borrow_account_trackers(host)?.iter() {
+        for (tracker_index, tracker) in self.try_borrow_account_trackers(host)?.iter().enumerate() {
             // Tracker can only be borrowed by the authorization manager itself.
             // The only scenario in which re-borrow might occur is when
             // `require_auth` is called within `__check_auth` call. The tracker
@@ -979,7 +1042,13 @@ impl AuthorizationManager {
                 if !host.compare(&tracker.address, &address)?.is_eq() {
                     continue;
                 }
-                match tracker.maybe_authorize_invocation(host, function, !has_active_tracker) {
+                match tracker.maybe_authorize_invocation(
+                    host,
+                    function,
+                    !has_active_tracker,
+                    tracker_index,
+                    &self.undo_log,
+                ) {
                     // If tracker doesn't have a matching invocation,
                     // just skip it (there could still be another
                     // tracker  that matches it).
@@ -1168,39 +1237,53 @@ impl AuthorizationManager {
     // metering: covered
     fn snapshot(&self, host: &Host) -> Result<AuthorizationManagerSnapshot, HostError> {
         let _span = tracy_span!("snapshot auth");
-        let account_trackers_snapshot = match &self.mode {
+        let state = match &self.mode {
             AuthorizationMode::Enforcing => {
                 let len = self.try_borrow_account_trackers(host)?.len();
-                let mut snapshots =
-                    Vec::<Option<AccountAuthorizationTrackerSnapshot>>::with_metered_capacity(
-                        len, host,
-                    )?;
+                Vec::<Option<AccountAuthorizationTrackerSnapshot>>::charge_bulk_init_cpy(
+                    len as u64, host,
+                )?;
                 for t in self.try_borrow_account_trackers(host)?.iter() {
-                    let sp = if let Ok(tracker) = t.try_borrow() {
-                        Some(tracker.snapshot(host.as_budget())?)
-                    } else {
-                        // If tracker is borrowed, snapshotting it is a no-op
-                        // (it can't change until we release it higher up the
-                        // stack).
-                        None
-                    };
-                    snapshots.push(sp);
+                    if let Ok(tracker) = t.try_borrow() {
+                        tracker.charge_snapshot_metering(host.as_budget())?;
+                    }
                 }
-                AccountTrackersSnapshot::Enforcing(snapshots)
+                let invoker_contract_trackers_len =
+                    self.try_borrow_invoker_contract_trackers(host)?.len();
+                <Result<Vec<AuthorizedInvocationSnapshot>, HostError> as MeteredContainer>::charge_bulk_init_cpy(
+                    invoker_contract_trackers_len as u64,
+                    host,
+                )?;
+                for t in self.try_borrow_invoker_contract_trackers(host)?.iter() {
+                    t.invocation_tracker
+                        .charge_snapshot_metering(host.as_budget())?;
+                }
+                AuthorizationManagerSnapshotState::Enforcing(
+                    EnforcingAuthorizationManagerSnapshot {
+                        undo_log_len: self.undo_log.borrow().len(),
+                        invoker_contract_trackers_len,
+                    },
+                )
             }
             #[cfg(any(test, feature = "recording_mode"))]
             AuthorizationMode::Recording(_) => {
                 // All trackers should be available to borrow for copy as in
                 // recording mode we can't have recursive authorization.
                 // metering: free for recording
-                AccountTrackersSnapshot::Recording(self.try_borrow_account_trackers(host)?.clone())
+                let account_trackers = self.try_borrow_account_trackers(host)?.clone();
+                let invoker_contract_tracker_root_snapshots = self
+                    .try_borrow_invoker_contract_trackers(host)?
+                    .iter()
+                    .map(|t| t.invocation_tracker.snapshot(host.as_budget()))
+                    .metered_collect::<Result<Vec<AuthorizedInvocationSnapshot>, HostError>>(
+                        host,
+                    )??;
+                AuthorizationManagerSnapshotState::Recording {
+                    account_trackers,
+                    invoker_contract_tracker_root_snapshots,
+                }
             }
         };
-        let invoker_contract_tracker_root_snapshots = self
-            .try_borrow_invoker_contract_trackers(host)?
-            .iter()
-            .map(|t| t.invocation_tracker.snapshot(host.as_budget()))
-            .metered_collect::<Result<Vec<AuthorizedInvocationSnapshot>, HostError>>(host)??;
         #[cfg(any(test, feature = "recording_mode"))]
         let tracker_by_address_handle = match &self.mode {
             AuthorizationMode::Enforcing => None,
@@ -1212,8 +1295,7 @@ impl AuthorizationManager {
             ),
         };
         Ok(AuthorizationManagerSnapshot {
-            account_trackers_snapshot,
-            invoker_contract_tracker_root_snapshots,
+            state,
             #[cfg(any(test, feature = "recording_mode"))]
             tracker_by_address_handle,
         })
@@ -1227,67 +1309,38 @@ impl AuthorizationManager {
         snapshot: AuthorizationManagerSnapshot,
     ) -> Result<(), HostError> {
         let _span = tracy_span!("rollback auth");
-        match snapshot.account_trackers_snapshot {
-            AccountTrackersSnapshot::Enforcing(trackers_snapshot) => {
-                let trackers = self.try_borrow_account_trackers(host)?;
-                if trackers.len() != trackers_snapshot.len() {
+        match snapshot.state {
+            AuthorizationManagerSnapshotState::Enforcing(enforcing_snapshot) => {
+                self.rollback_enforcing(host, enforcing_snapshot)?;
+            }
+            #[cfg(any(test, feature = "recording_mode"))]
+            AuthorizationManagerSnapshotState::Recording {
+                account_trackers,
+                invoker_contract_tracker_root_snapshots,
+            } => {
+                *self.try_borrow_account_trackers_mut(host)? = account_trackers;
+                let mut invoker_trackers = self.try_borrow_invoker_contract_trackers_mut(host)?;
+
+                if invoker_trackers.len() < invoker_contract_tracker_root_snapshots.len() {
                     return Err(host.err(
                         ScErrorType::Auth,
                         ScErrorCode::InternalError,
-                        "unexpected bad auth snapshot",
+                        "the number of invoker contract trackers is smaller than in the snapshot",
                         &[],
                     ));
                 }
-                for (i, tracker) in trackers.iter().enumerate() {
-                    let Some(snapopt) = trackers_snapshot.get(i) else {
-                        return Err(host.err(
-                            ScErrorType::Auth,
-                            ScErrorCode::InternalError,
-                            "unexpected auth snapshot index",
-                            &[],
-                        ));
-                    };
-                    if let Some(tracker_snapshot) = snapopt {
-                        tracker
-                            .try_borrow_mut()
-                            .map_err(|_| {
-                                host.err(
-                                    ScErrorType::Auth,
-                                    ScErrorCode::InternalError,
-                                    "unexpected bad auth borrow",
-                                    &[],
-                                )
-                            })?
-                            .rollback(&tracker_snapshot)?;
-                    }
+                // If there are more trackers than in the snapshot, then the trackers have been
+                // created in the current (failed) frame, so we should remove them as a part
+                // of rollback.
+                invoker_trackers.truncate(invoker_contract_tracker_root_snapshots.len());
+
+                for (tracker, snapshot) in invoker_trackers
+                    .iter_mut()
+                    .zip(invoker_contract_tracker_root_snapshots.iter())
+                {
+                    tracker.invocation_tracker.rollback(snapshot)?;
                 }
             }
-            #[cfg(any(test, feature = "recording_mode"))]
-            AccountTrackersSnapshot::Recording(s) => {
-                *self.try_borrow_account_trackers_mut(host)? = s;
-            }
-        }
-
-        let mut invoker_trackers = self.try_borrow_invoker_contract_trackers_mut(host)?;
-
-        if invoker_trackers.len() < snapshot.invoker_contract_tracker_root_snapshots.len() {
-            return Err(host.err(
-                ScErrorType::Auth,
-                ScErrorCode::InternalError,
-                "the number of invoker contract trackers is smaller than in the snapshot",
-                &[],
-            ));
-        }
-        // If there are more trackers than in the snapshot, then the trackers have been
-        // created in the current (failed) frame, so we should remove them as a part
-        // of rollback.
-        invoker_trackers.truncate(snapshot.invoker_contract_tracker_root_snapshots.len());
-
-        for (tracker, snapshot) in invoker_trackers
-            .iter_mut()
-            .zip(snapshot.invoker_contract_tracker_root_snapshots.iter())
-        {
-            tracker.invocation_tracker.rollback(snapshot)?;
         }
 
         #[cfg(any(test, feature = "recording_mode"))]
@@ -1298,6 +1351,114 @@ impl AuthorizationManager {
                     *recording_info.try_borrow_tracker_by_address_handle_mut(host)? =
                         tracker_by_address_handle;
                 }
+            }
+        }
+        Ok(())
+    }
+
+    // Rolls back enforcing-mode auth mutations using the undo log captured by
+    // `snapshot`.
+    // metering: free
+    fn rollback_enforcing(
+        &self,
+        host: &Host,
+        snapshot: EnforcingAuthorizationManagerSnapshot,
+    ) -> Result<(), HostError> {
+        let mut undo_log = self.undo_log.try_borrow_mut().map_err(|_| {
+            host.err(
+                ScErrorType::Auth,
+                ScErrorCode::InternalError,
+                "authorization_manager.undo_log.try_borrow_mut failed",
+                &[],
+            )
+        })?;
+        if snapshot.undo_log_len > undo_log.len() {
+            return Err(host.err(
+                ScErrorType::Auth,
+                ScErrorCode::InternalError,
+                "unexpected auth undo log snapshot",
+                &[],
+            ));
+        }
+        for entry in undo_log[snapshot.undo_log_len..].iter().rev() {
+            self.rollback_undo_entry(host, entry)?;
+        }
+        undo_log.truncate(snapshot.undo_log_len);
+        drop(undo_log);
+
+        let mut invoker_trackers = self.try_borrow_invoker_contract_trackers_mut(host)?;
+        if invoker_trackers.len() < snapshot.invoker_contract_trackers_len {
+            return Err(host.err(
+                ScErrorType::Auth,
+                ScErrorCode::InternalError,
+                "the number of invoker contract trackers is smaller than in the snapshot",
+                &[],
+            ));
+        }
+        invoker_trackers.truncate(snapshot.invoker_contract_trackers_len);
+        Ok(())
+    }
+
+    // metering: free
+    fn rollback_undo_entry(&self, host: &Host, entry: &AuthUndoEntry) -> Result<(), HostError> {
+        match entry {
+            AuthUndoEntry::Invocation { tracker, mutation } => match tracker {
+                AuthTrackerRef::Account(tracker_index) => {
+                    let trackers = self.try_borrow_account_trackers(host)?;
+                    let Some(tracker) = trackers.get(*tracker_index) else {
+                        return Err(host.err(
+                            ScErrorType::Auth,
+                            ScErrorCode::InternalError,
+                            "unexpected account auth undo tracker index",
+                            &[],
+                        ));
+                    };
+                    tracker
+                        .try_borrow_mut()
+                        .map_err(|_| {
+                            host.err(
+                                ScErrorType::Auth,
+                                ScErrorCode::InternalError,
+                                "unexpected account auth undo borrow",
+                                &[],
+                            )
+                        })?
+                        .invocation_tracker
+                        .rollback_invocation_mutation(mutation)?;
+                }
+                AuthTrackerRef::InvokerContract(tracker_index) => {
+                    let mut trackers = self.try_borrow_invoker_contract_trackers_mut(host)?;
+                    if let Some(tracker) = trackers.get_mut(*tracker_index) {
+                        tracker
+                            .invocation_tracker
+                            .rollback_invocation_mutation(mutation)?;
+                    }
+                }
+            },
+            AuthUndoEntry::AccountVerified {
+                tracker_index,
+                verified,
+            } => {
+                let trackers = self.try_borrow_account_trackers(host)?;
+                let Some(tracker) = trackers.get(*tracker_index) else {
+                    return Err(host.err(
+                        ScErrorType::Auth,
+                        ScErrorCode::InternalError,
+                        "unexpected account verified undo tracker index",
+                        &[],
+                    ));
+                };
+                tracker
+                    .try_borrow_mut()
+                    .map_err(|_| {
+                        host.err(
+                            ScErrorType::Auth,
+                            ScErrorCode::InternalError,
+                            "unexpected account verified undo borrow",
+                            &[],
+                        )
+                    })?
+                    .verified = *verified;
             }
         }
         Ok(())
@@ -1595,17 +1756,12 @@ impl InvocationTracker {
     // metering: free for recording
     #[cfg(any(test, feature = "recording_mode"))]
     fn new_recording(function: AuthorizedFunction, current_stack_len: usize) -> Self {
-        // Create the stack of `MatchState::Unmatched` leading to the current invocation to
-        // represent invocations that didn't need authorization on behalf of
-        // the tracked address.
         let mut match_stack = vec![MatchState::Unmatched; current_stack_len - 1];
-        // Add a MatchState for the current(root) invocation.
         match_stack.push(MatchState::RootMatch);
-        let root_exhausted_frame = Some(match_stack.len() - 1);
         Self {
             root_authorized_invocation: AuthorizedInvocation::new_recording(function),
             match_stack,
-            root_exhausted_frame,
+            root_exhausted_frame: Some(current_stack_len - 1),
             is_fully_processed: false,
         }
     }
@@ -1635,8 +1791,8 @@ impl InvocationTracker {
 
     // metering: covered
     fn push_frame(&mut self, budget: &Budget) -> Result<(), HostError> {
-        Vec::<usize>::charge_bulk_init_cpy(1, budget)?;
         self.match_stack.push(MatchState::Unmatched);
+        Vec::<usize>::charge_bulk_init_cpy(1, budget)?;
         Ok(())
     }
 
@@ -1662,10 +1818,10 @@ impl InvocationTracker {
 
     // metering: free
     fn current_frame_is_already_matched(&self) -> bool {
-        match self.match_stack.last() {
-            Some(x) => x.is_matched(),
-            _ => false,
-        }
+        self.match_stack
+            .last()
+            .map(MatchState::is_matched)
+            .unwrap_or(false)
     }
 
     // Tries to match the provided invocation as an extension of the last
@@ -1674,8 +1830,8 @@ impl InvocationTracker {
     // it writes the match to the corresponding entry in
     // [`InvocationTracker::match_stack`].
     //
-    // Returns `true` if the match has been found for the first time per current
-    // frame.
+    // Returns the mutation if the match has been found for the first time per
+    // current frame.
     //
     // Metering: covered by components
     fn maybe_extend_invocation_match(
@@ -1683,7 +1839,7 @@ impl InvocationTracker {
         host: &Host,
         function: &AuthorizedFunction,
         allow_matching_root: bool,
-    ) -> Result<bool, HostError> {
+    ) -> Result<Option<InvocationMutation>, HostError> {
         if self.match_stack.is_empty() {
             return Err(host.err(
                 ScErrorType::Auth,
@@ -1693,9 +1849,12 @@ impl InvocationTracker {
             ));
         }
         if self.current_frame_is_already_matched() {
-            return Ok(false);
+            return Ok(None);
         }
-        let mut new_match_state = MatchState::Unmatched;
+        let mut new_match_state = None;
+        let mut exhausted_path = Vec::<usize>::new();
+        let previous_root_exhausted_frame = self.root_exhausted_frame;
+        let previous_is_fully_processed = self.is_fully_processed;
         if let Some(curr_invocation) = self.last_authorized_invocation_mut()? {
             for (index_in_parent, sub_invocation) in
                 curr_invocation.sub_invocations.iter_mut().enumerate()
@@ -1703,9 +1862,19 @@ impl InvocationTracker {
                 if !sub_invocation.is_exhausted
                     && host.compare(&sub_invocation.function, function)?.is_eq()
                 {
-                    new_match_state = MatchState::SubMatch { index_in_parent };
+                    new_match_state = Some(MatchState::SubMatch { index_in_parent });
                     sub_invocation.is_exhausted = true;
                     break;
+                }
+            }
+            if let Some(new_match_state) = new_match_state {
+                for m in self.match_stack.iter() {
+                    if let MatchState::SubMatch { index_in_parent } = m {
+                        exhausted_path.push(*index_in_parent);
+                    }
+                }
+                if let MatchState::SubMatch { index_in_parent } = new_match_state {
+                    exhausted_path.push(index_in_parent);
                 }
             }
         } else if !self.root_authorized_invocation.is_exhausted
@@ -1714,21 +1883,18 @@ impl InvocationTracker {
                 .compare(&self.root_authorized_invocation.function, &function)?
                 .is_eq()
         {
-            new_match_state = MatchState::RootMatch;
+            new_match_state = Some(MatchState::RootMatch);
             self.root_authorized_invocation.is_exhausted = true;
             self.root_exhausted_frame = Some(self.match_stack.len() - 1);
         }
-        if new_match_state.is_matched() {
-            *self.match_stack.last_mut().ok_or_else(|| {
-                host.err(
-                    ScErrorType::Auth,
-                    ScErrorCode::InternalError,
-                    "invalid match_stack",
-                    &[],
-                )
-            })? = new_match_state;
-        }
-        Ok(new_match_state.is_matched())
+        Ok(new_match_state.map(|state| {
+            *self.match_stack.last_mut().expect("checked above") = state;
+            InvocationMutation {
+                path: exhausted_path,
+                root_exhausted_frame: previous_root_exhausted_frame,
+                is_fully_processed: previous_is_fully_processed,
+            }
+        }))
     }
 
     // Records the invocation in this tracker.
@@ -1760,7 +1926,9 @@ impl InvocationTracker {
                 .sub_invocations
                 .push(AuthorizedInvocation::new_recording(function));
             let index_in_parent = curr_invocation.sub_invocations.len() - 1;
-            *self.match_stack.last_mut().unwrap() = MatchState::SubMatch { index_in_parent };
+            *self.match_stack.last_mut().ok_or_else(|| {
+                HostError::from((ScErrorType::Auth, ScErrorCode::InternalError))
+            })? = MatchState::SubMatch { index_in_parent };
         } else {
             // This would be a bug
             return Err(host.err(
@@ -1776,12 +1944,31 @@ impl InvocationTracker {
     // metering: free
     #[cfg(any(test, feature = "recording_mode"))]
     fn has_matched_invocations_in_stack(&self) -> bool {
-        self.match_stack.iter().any(|i| i.is_matched())
+        self.match_stack.iter().any(MatchState::is_matched)
     }
 
     // metering: covered
     fn snapshot(&self, budget: &Budget) -> Result<AuthorizedInvocationSnapshot, HostError> {
         self.root_authorized_invocation.snapshot(budget)
+    }
+
+    // metering: covered
+    fn charge_snapshot_metering(&self, budget: &Budget) -> Result<(), HostError> {
+        self.root_authorized_invocation
+            .charge_snapshot_metering(budget)
+    }
+
+    // metering: free
+    fn rollback_invocation_mutation(
+        &mut self,
+        mutation: &InvocationMutation,
+    ) -> Result<(), HostError> {
+        self.root_authorized_invocation
+            .get_mut_at_path(&mutation.path)?
+            .is_exhausted = false;
+        self.root_exhausted_frame = mutation.root_exhausted_frame;
+        self.is_fully_processed = mutation.is_fully_processed;
+        Ok(())
     }
 
     // metering: covered
@@ -1902,18 +2089,35 @@ impl AccountAuthorizationTracker {
         host: &Host,
         function: &AuthorizedFunction,
         allow_matching_root: bool,
+        tracker_index: usize,
+        undo_log: &RefCell<Vec<AuthUndoEntry>>,
     ) -> Result<bool, HostError> {
-        if !self.invocation_tracker.maybe_extend_invocation_match(
+        let Some(mutation) = self.invocation_tracker.maybe_extend_invocation_match(
             host,
             function,
             allow_matching_root,
-        )? {
+        )?
+        else {
             // The call isn't found in the currently tracked tree or is already
             // authorized in it.
             // That doesn't necessarily mean it's unauthorized (it can be
             // authorized in a different tracker).
             return Ok(false);
-        }
+        };
+        undo_log
+            .try_borrow_mut()
+            .map_err(|_| {
+                host.err(
+                    ScErrorType::Auth,
+                    ScErrorCode::InternalError,
+                    "authorization_manager.undo_log.try_borrow_mut failed",
+                    &[],
+                )
+            })?
+            .push(AuthUndoEntry::Invocation {
+                tracker: AuthTrackerRef::Account(tracker_index),
+                mutation,
+            });
         if !self.verified {
             let authenticate_res = self
                 .authenticate(host)
@@ -1939,6 +2143,20 @@ impl AccountAuthorizationTracker {
             if let Some(err) = authenticate_res.err() {
                 return Err(err);
             }
+            undo_log
+                .try_borrow_mut()
+                .map_err(|_| {
+                    host.err(
+                        ScErrorType::Auth,
+                        ScErrorCode::InternalError,
+                        "authorization_manager.undo_log.try_borrow_mut failed",
+                        &[],
+                    )
+                })?
+                .push(AuthUndoEntry::AccountVerified {
+                    tracker_index,
+                    verified: self.verified,
+                });
             self.verified = true;
         }
         Ok(true)
@@ -2206,6 +2424,11 @@ impl AccountAuthorizationTracker {
     }
 
     // metering: covered
+    fn charge_snapshot_metering(&self, budget: &Budget) -> Result<(), HostError> {
+        self.invocation_tracker.charge_snapshot_metering(budget)
+    }
+
+    // metering: covered
     fn rollback(
         &mut self,
         snapshot: &AccountAuthorizationTrackerSnapshot,
@@ -2266,11 +2489,32 @@ impl InvokerContractAuthorizationTracker {
         &mut self,
         host: &Host,
         function: &AuthorizedFunction,
+        tracker_index: usize,
+        undo_log: &RefCell<Vec<AuthUndoEntry>>,
     ) -> Result<bool, HostError> {
         // Authorization is successful if function is just matched by the
         // tracker. No authentication is needed.
-        self.invocation_tracker
-            .maybe_extend_invocation_match(host, function, true)
+        let Some(mutation) = self
+            .invocation_tracker
+            .maybe_extend_invocation_match(host, function, true)?
+        else {
+            return Ok(false);
+        };
+        undo_log
+            .try_borrow_mut()
+            .map_err(|_| {
+                host.err(
+                    ScErrorType::Auth,
+                    ScErrorCode::InternalError,
+                    "authorization_manager.undo_log.try_borrow_mut failed",
+                    &[],
+                )
+            })?
+            .push(AuthUndoEntry::Invocation {
+                tracker: AuthTrackerRef::InvokerContract(tracker_index),
+                mutation,
+            });
+        Ok(true)
     }
 }
 
