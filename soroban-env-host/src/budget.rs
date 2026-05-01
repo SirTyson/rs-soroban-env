@@ -195,12 +195,20 @@ impl BudgetTracker {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BudgetTrackingMode {
+    Full,
+    Summary,
+}
+
 #[derive(Clone)]
 pub(crate) struct BudgetImpl {
     cpu_insns: BudgetDimension,
     mem_bytes: BudgetDimension,
     /// For the purpose of calibration and reporting; not used for budget-limiting nor does it affect consensus
     tracker: BudgetTracker,
+    tracking_mode: BudgetTrackingMode,
+    vm_instantiation_cpu: u64,
     is_in_shadow_mode: bool,
     fuel_costs: wasmi::FuelCosts,
     depth_limit: u32,
@@ -213,15 +221,36 @@ impl BudgetImpl {
         mem_limit: u64,
         cpu_cost_params: ContractCostParams,
         mem_cost_params: ContractCostParams,
+        tracking_mode: BudgetTrackingMode,
     ) -> Result<Self, HostError> {
         Ok(Self {
             cpu_insns: BudgetDimension::try_from_config(cpu_cost_params, cpu_limit)?,
             mem_bytes: BudgetDimension::try_from_config(mem_cost_params, mem_limit)?,
             tracker: BudgetTracker::default(),
+            tracking_mode,
+            vm_instantiation_cpu: 0,
             is_in_shadow_mode: false,
             fuel_costs: load_calibrated_fuel_costs(),
             depth_limit: DEFAULT_HOST_DEPTH_LIMIT,
         })
+    }
+
+    fn validate_tracker_input_shape(
+        &self,
+        ty: ContractCostType,
+        input: Option<u64>,
+    ) -> Result<(), HostError> {
+        let tracker = self
+            .tracker
+            .cost_trackers
+            .get(ty as usize)
+            .ok_or_else(|| HostError::from((ScErrorType::Budget, ScErrorCode::InternalError)))?;
+
+        match (tracker.inputs, input) {
+            (None, None) | (Some(_), Some(_)) => Ok(()),
+            // internal logic error, a wrong cost type has been passed in
+            _ => Err((ScErrorType::Budget, ScErrorCode::InternalError).into()),
+        }
     }
 
     pub(crate) fn get_memory_cost(
@@ -239,21 +268,22 @@ impl BudgetImpl {
         iterations: u64,
         input: Option<u64>,
     ) -> Result<(), HostError> {
-        let tracker = self
-            .tracker
-            .cost_trackers
-            .get_mut(ty as usize)
-            .ok_or_else(|| HostError::from((ScErrorType::Budget, ScErrorCode::InternalError)))?;
-
+        self.validate_tracker_input_shape(ty, input)?;
         if !self.is_in_shadow_mode {
             // update tracker for reporting
-            self.tracker.meter_count = self.tracker.meter_count.saturating_add(1);
-            tracker.iterations = tracker.iterations.saturating_add(iterations);
-            match (&mut tracker.inputs, input) {
-                (None, None) => (),
-                (Some(t), Some(i)) => *t = t.saturating_add(i.saturating_mul(iterations)),
-                // internal logic error, a wrong cost type has been passed in
-                _ => return Err((ScErrorType::Budget, ScErrorCode::InternalError).into()),
+            if self.tracking_mode == BudgetTrackingMode::Full {
+                let tracker = self
+                    .tracker
+                    .cost_trackers
+                    .get_mut(ty as usize)
+                    .ok_or_else(|| {
+                        HostError::from((ScErrorType::Budget, ScErrorCode::InternalError))
+                    })?;
+                self.tracker.meter_count = self.tracker.meter_count.saturating_add(1);
+                tracker.iterations = tracker.iterations.saturating_add(iterations);
+                if let (Some(t), Some(i)) = (&mut tracker.inputs, input) {
+                    *t = t.saturating_add(i.saturating_mul(iterations));
+                }
             };
         }
 
@@ -265,7 +295,20 @@ impl BudgetImpl {
             IsShadowMode(self.is_in_shadow_mode),
         )?;
         if !self.is_in_shadow_mode {
-            tracker.cpu = tracker.cpu.saturating_add(cpu_charged);
+            if self.tracking_mode == BudgetTrackingMode::Full {
+                let tracker = self
+                    .tracker
+                    .cost_trackers
+                    .get_mut(ty as usize)
+                    .ok_or_else(|| {
+                        HostError::from((ScErrorType::Budget, ScErrorCode::InternalError))
+                    })?;
+                tracker.cpu = tracker.cpu.saturating_add(cpu_charged);
+            }
+            if ty == ContractCostType::VmInstantiation {
+                self.vm_instantiation_cpu =
+                    self.vm_instantiation_cpu.saturating_add(cpu_charged);
+            }
         }
         self.cpu_insns
             .check_budget_limit(IsShadowMode(self.is_in_shadow_mode))?;
@@ -278,7 +321,16 @@ impl BudgetImpl {
             IsShadowMode(self.is_in_shadow_mode),
         )?;
         if !self.is_in_shadow_mode {
-            tracker.mem = tracker.mem.saturating_add(mem_charged);
+            if self.tracking_mode == BudgetTrackingMode::Full {
+                let tracker = self
+                    .tracker
+                    .cost_trackers
+                    .get_mut(ty as usize)
+                    .ok_or_else(|| {
+                        HostError::from((ScErrorType::Budget, ScErrorCode::InternalError))
+                    })?;
+                tracker.mem = tracker.mem.saturating_add(mem_charged);
+            }
         }
         self.mem_bytes
             .check_budget_limit(IsShadowMode(self.is_in_shadow_mode))
@@ -325,13 +377,12 @@ impl BudgetImpl {
             return Ok(());
         }
 
-        let tracker = self
-            .tracker
-            .cost_trackers
-            .get_mut(ty as usize)
-            .ok_or_else(|| HostError::from((ScErrorType::Budget, ScErrorCode::InternalError)))?;
-
-        if !self.is_in_shadow_mode {
+        if !self.is_in_shadow_mode && self.tracking_mode == BudgetTrackingMode::Full {
+            let tracker = self
+                .tracker
+                .cost_trackers
+                .get_mut(ty as usize)
+                .ok_or_else(|| HostError::from((ScErrorType::Budget, ScErrorCode::InternalError)))?;
             let count_u32 = u32::try_from(total_count).unwrap_or(u32::MAX);
             self.tracker.meter_count = self.tracker.meter_count.saturating_add(count_u32);
             tracker.iterations = tracker.iterations.saturating_add(total_count);
@@ -390,6 +441,8 @@ impl Default for BudgetImpl {
             cpu_insns: BudgetDimension::default(),
             mem_bytes: BudgetDimension::default(),
             tracker: Default::default(),
+            tracking_mode: BudgetTrackingMode::Full,
+            vm_instantiation_cpu: 0,
             is_in_shadow_mode: false,
             fuel_costs: load_calibrated_fuel_costs(),
             depth_limit: DEFAULT_HOST_DEPTH_LIMIT,
@@ -1350,6 +1403,26 @@ impl Budget {
             mem_limit,
             cpu_cost_params,
             mem_cost_params,
+            BudgetTrackingMode::Full,
+        )?))))
+    }
+
+    /// Initializes the budget from network configuration settings with summary
+    /// tracking. This mode preserves aggregate CPU/memory totals, budget-limit
+    /// checks, VM-instantiation CPU, and timing summaries, but skips full
+    /// per-cost diagnostic tracker maintenance.
+    pub fn try_from_configs_summary_tracking(
+        cpu_limit: u64,
+        mem_limit: u64,
+        cpu_cost_params: ContractCostParams,
+        mem_cost_params: ContractCostParams,
+    ) -> Result<Self, HostError> {
+        Ok(Self(Rc::new(RefCell::new(BudgetImpl::try_from_configs(
+            cpu_limit,
+            mem_limit,
+            cpu_cost_params,
+            mem_cost_params,
+            BudgetTrackingMode::Summary,
         )?))))
     }
 
@@ -1484,8 +1557,11 @@ impl Budget {
     }
 
     pub fn get_tracker(&self, ty: ContractCostType) -> Result<CostTracker, HostError> {
-        self.0
-            .try_borrow_or_err()?
+        let budget = self.0.try_borrow_or_err()?;
+        if budget.tracking_mode != BudgetTrackingMode::Full {
+            return Err((ScErrorType::Budget, ScErrorCode::InternalError).into());
+        }
+        budget
             .tracker
             .cost_trackers
             .get(ty as usize)
@@ -1506,6 +1582,14 @@ impl Budget {
 
     pub fn get_cpu_insns_consumed(&self) -> Result<u64, HostError> {
         Ok(self.0.try_borrow_or_err()?.cpu_insns.get_total_count())
+    }
+
+    pub fn get_cpu_insns_excluding_vm_instantiation(&self) -> Result<u64, HostError> {
+        let budget = self.0.try_borrow_or_err()?;
+        Ok(budget
+            .cpu_insns
+            .get_total_count()
+            .saturating_sub(budget.vm_instantiation_cpu))
     }
 
     pub fn get_mem_bytes_consumed(&self) -> Result<u64, HostError> {
