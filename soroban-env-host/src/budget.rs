@@ -1419,6 +1419,17 @@ impl Budget {
             .charge_val_ser_batched(hist)
     }
 
+    pub(crate) fn check_limited_depth_available(&self) -> Result<(), HostError> {
+        if self.0.try_borrow_or_err()?.depth_limit == 0 {
+            return Err(Error::from_type_and_code(
+                ScErrorType::Context,
+                ScErrorCode::ExceededLimit,
+            )
+            .into());
+        }
+        Ok(())
+    }
+
     pub(crate) fn get_memory_cost(
         &self,
         ty: ContractCostType,

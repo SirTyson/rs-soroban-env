@@ -12,12 +12,14 @@ use crate::{
     num::{i256_from_pieces, i256_into_pieces, u256_from_pieces, u256_into_pieces},
     xdr::{
         self, int128_helpers, AccountId, ContractCostType, ContractDataDurability, ContractId,
-        Hash, Int128Parts, Int256Parts, LedgerKey, LedgerKeyContractData, MuxedEd25519Account,
-        PublicKey, ScAddress, ScBytes, ScErrorCode, ScErrorType, ScMap, ScMapEntry, ScSymbol,
-        ScVal, ScVec, UInt128Parts, UInt256Parts, Uint256, VecM,
+        Duration, Hash, Int128Parts, Int256Parts, LedgerKey, LedgerKeyContractData,
+        MuxedEd25519Account, PublicKey, ScAddress, ScBytes, ScErrorCode, ScErrorType, ScMap,
+        ScMapEntry, ScSymbol, ScVal, ScVec, TimePoint, UInt128Parts, UInt256Parts, Uint256, VecM,
     },
-    AddressObject, BytesObject, Convert, Host, HostError, Object, ScValObjRef, ScValObject, Symbol,
-    SymbolObject, TryFromVal, TryIntoVal, U256Val, U32Val, Val, VecObject,
+    AddressObject, BytesObject, Convert, DurationSmall, Error, Host, HostError, I128Small,
+    I256Small, I32Val, I64Small, Object, ScValObjRef, ScValObject, Symbol, SymbolObject,
+    SymbolSmall, Tag, TimepointSmall, TryFromVal, TryIntoVal, U128Small, U256Small, U256Val,
+    U32Val, U64Small, Val, VecObject,
 };
 
 use super::ErrorHandler;
@@ -391,6 +393,141 @@ impl<'a> Convert<ScValObjRef<'a>, Object> for Host {
 }
 
 impl Host {
+    fn host_val_to_scval_error<E>(&self, err: E, val: Val) -> HostError
+    where
+        Error: From<E>,
+    {
+        self.error(
+            err.into(),
+            "failed to convert host value to ScVal",
+            &[val],
+        )
+    }
+
+    fn scval_to_host_val_error<E>(&self, err: E) -> HostError
+    where
+        Error: From<E>,
+    {
+        self.error(err.into(), "failed to convert ScVal to host value", &[])
+    }
+
+    fn scval_from_immediate_host_val(&self, val: Val) -> Option<Result<ScVal, HostError>> {
+        Some(match val.get_tag() {
+            Tag::False => Ok(ScVal::Bool(false)),
+            Tag::True => Ok(ScVal::Bool(true)),
+            Tag::Void => Ok(ScVal::Void),
+            Tag::Error => match Error::try_from(val) {
+                Ok(e) => ScVal::try_from(e).map_err(|e| self.host_val_to_scval_error(e, val)),
+                Err(e) => Err(self.host_val_to_scval_error(e, val)),
+            },
+            Tag::U32Val => U32Val::try_from(val)
+                .map(Into::into)
+                .map(ScVal::U32)
+                .map_err(|e| self.host_val_to_scval_error(e, val)),
+            Tag::I32Val => I32Val::try_from(val)
+                .map(Into::into)
+                .map(ScVal::I32)
+                .map_err(|e| self.host_val_to_scval_error(e, val)),
+            Tag::U64Small => U64Small::try_from(val)
+                .map(Into::into)
+                .map(ScVal::U64)
+                .map_err(|e| self.host_val_to_scval_error(e, val)),
+            Tag::I64Small => I64Small::try_from(val)
+                .map(Into::into)
+                .map(ScVal::I64)
+                .map_err(|e| self.host_val_to_scval_error(e, val)),
+            Tag::TimepointSmall => TimepointSmall::try_from(val)
+                .map(Into::into)
+                .map(|u| ScVal::Timepoint(TimePoint(u)))
+                .map_err(|e| self.host_val_to_scval_error(e, val)),
+            Tag::DurationSmall => DurationSmall::try_from(val)
+                .map(Into::into)
+                .map(|u| ScVal::Duration(Duration(u)))
+                .map_err(|e| self.host_val_to_scval_error(e, val)),
+            Tag::U128Small => U128Small::try_from(val)
+                .map(|u| ScVal::U128(UInt128Parts {
+                    hi: 0,
+                    lo: u128::from(u) as u64,
+                }))
+                .map_err(|e| self.host_val_to_scval_error(e, val)),
+            Tag::I128Small => I128Small::try_from(val)
+                .map(Into::into)
+                .map(|i: i128| ScVal::I128(Int128Parts {
+                    hi: (i >> 64) as i64,
+                    lo: i as u64,
+                }))
+                .map_err(|e| self.host_val_to_scval_error(e, val)),
+            Tag::U256Small => U256Small::try_from(val)
+                .and_then(ScVal::try_from)
+                .map_err(|e| self.host_val_to_scval_error(e, val)),
+            Tag::I256Small => I256Small::try_from(val)
+                .and_then(ScVal::try_from)
+                .map_err(|e| self.host_val_to_scval_error(e, val)),
+            Tag::SymbolSmall => match SymbolSmall::try_from(val) {
+                Ok(s) => ScVal::try_from(s).map_err(|e| self.host_val_to_scval_error(e, val)),
+                Err(e) => Err(self.host_val_to_scval_error(e, val)),
+            },
+            _ => return None,
+        })
+    }
+
+    fn host_val_from_immediate_scval(&self, scval: &ScVal) -> Option<Result<Val, HostError>> {
+        Some(match scval {
+            ScVal::Bool(b) => Ok(Val::from_bool(*b).into()),
+            ScVal::Void => Ok(Val::from_void().into()),
+            ScVal::Error(e) => Ok(e.into()),
+            ScVal::U32(u) => Ok((*u).into()),
+            ScVal::I32(i) => Ok((*i).into()),
+            ScVal::U64(u) => match U64Small::try_from(*u) {
+                Ok(u) => Ok(u.into()),
+                Err(_) => return None,
+            },
+            ScVal::I64(i) => match I64Small::try_from(*i) {
+                Ok(i) => Ok(i.into()),
+                Err(_) => return None,
+            },
+            ScVal::Timepoint(TimePoint(u)) => match TimepointSmall::try_from(*u) {
+                Ok(t) => Ok(t.into()),
+                Err(_) => return None,
+            },
+            ScVal::Duration(Duration(u)) => match DurationSmall::try_from(*u) {
+                Ok(d) => Ok(d.into()),
+                Err(_) => return None,
+            },
+            ScVal::U128(u) => {
+                let u: u128 = u.into();
+                match U128Small::try_from(u) {
+                    Ok(u) => Ok(u.into()),
+                    Err(_) => return None,
+                }
+            }
+            ScVal::I128(i) => {
+                let i: i128 = i.into();
+                match I128Small::try_from(i) {
+                    Ok(i) => Ok(i.into()),
+                    Err(_) => return None,
+                }
+            }
+            ScVal::U256(u) => match U256Small::try_from(u256_from_pieces(
+                u.hi_hi, u.hi_lo, u.lo_hi, u.lo_lo,
+            )) {
+                Ok(u) => Ok(u.into()),
+                Err(_) => return None,
+            },
+            ScVal::I256(i) => match I256Small::try_from(i256_from_pieces(
+                i.hi_hi, i.hi_lo, i.lo_hi, i.lo_lo,
+            )) {
+                Ok(i) => Ok(i.into()),
+                Err(_) => return None,
+            },
+            ScVal::Symbol(s) => match SymbolSmall::try_from_bytes(s.as_slice()) {
+                Ok(sym) => Ok(sym.into()),
+                Err(_) => return None,
+            },
+            _ => return None,
+        })
+    }
+
     pub(crate) fn check_val_representable_scval(&self, scval: &ScVal) -> Result<(), HostError> {
         if Val::can_represent_scval(&scval) {
             Ok(())
@@ -409,6 +546,12 @@ impl Host {
         // Metering of val conversion happens only if an object is encountered,
         // and is done inside `from_host_obj`.
         let _span = tracy_span!("Val to ScVal");
+        if let Some(scval) = self.scval_from_immediate_host_val(val) {
+            self.budget_ref().check_limited_depth_available()?;
+            let scval = scval?;
+            self.check_val_representable_scval(&scval)?;
+            return Ok(scval);
+        }
         let scval = self.budget_cloned().with_limited_depth(|_| {
             ScVal::try_from_val(self, &val)
                 .map_err(|cerr| self.error(cerr, "failed to convert host value to ScVal", &[val]))
@@ -421,6 +564,12 @@ impl Host {
 
     pub(crate) fn from_host_val_for_storage(&self, val: Val) -> Result<ScVal, HostError> {
         let _span = tracy_span!("Val to ScVal");
+        if let Some(scval) = self.scval_from_immediate_host_val(val) {
+            self.budget_ref().check_limited_depth_available()?;
+            let scval = scval?;
+            self.check_val_representable_scval(&scval)?;
+            return Ok(scval);
+        }
         *self.try_borrow_storage_key_conversion_active_mut()? = true;
         let scval_res = self.budget_cloned().with_limited_depth(|_| {
             ScVal::try_from_val(self, &val)
@@ -437,6 +586,10 @@ impl Host {
         // This is the depth limit checkpoint for `ScVal`->`Val` conversion.
         // Metering of val conversion happens only if an object is encountered,
         // and is done inside `to_host_obj`.
+        if let Some(val) = self.host_val_from_immediate_scval(v) {
+            self.budget_ref().check_limited_depth_available()?;
+            return val;
+        }
         self.budget_cloned().with_limited_depth(|_| {
             v.try_into_val(self)
                 .map_err(|cerr| self.error(cerr, "failed to convert ScVal to host value", &[]))
