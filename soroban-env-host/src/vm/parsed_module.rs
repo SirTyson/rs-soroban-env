@@ -10,7 +10,16 @@ use crate::{
 };
 
 use super::{Vm, HOST_FUNCTIONS};
-use std::{collections::BTreeSet, io::Cursor, sync::Arc};
+use std::{
+    collections::BTreeSet,
+    io::Cursor,
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc, OnceLock,
+    },
+};
+
+const UNVALIDATED_IMPORTS_PROTOCOL: u32 = u32::MAX;
 
 #[derive(Debug, Clone)]
 pub enum VersionedContractCodeCostInputs {
@@ -150,6 +159,8 @@ pub struct ParsedModule {
     pub wasmi_module: wasmi::Module,
     pub proto_version: u32,
     pub cost_inputs: VersionedContractCodeCostInputs,
+    import_symbols: OnceLock<BTreeSet<(String, String)>>,
+    validated_imports_protocol: AtomicU32,
 }
 
 pub fn wasm_module_memory_cost(
@@ -224,42 +235,51 @@ impl ParsedModule {
             wasmi_module,
             proto_version,
             cost_inputs,
+            import_symbols: OnceLock::new(),
+            validated_imports_protocol: AtomicU32::new(UNVALIDATED_IMPORTS_PROTOCOL),
         }))
     }
 
-    pub fn with_import_symbols<T>(
-        &self,
-        host: &Host,
-        callback: impl FnOnce(&BTreeSet<(&str, &str)>) -> Result<T, HostError>,
-    ) -> Result<T, HostError> {
+    fn import_symbols(&self) -> &BTreeSet<(String, String)> {
         // Cap symbols we're willing to import at 10 characters for each of
         // module and function name. in practice they are all 1-2 chars, but
         // we'll leave some future-proofing room here. The important point
         // is to not be introducing a DoS vector.
         const SYM_LEN_LIMIT: usize = 10;
-        let symbols: BTreeSet<(&str, &str)> = self
-            .wasmi_module
-            .imports()
-            .filter_map(|i| {
-                if i.ty().func().is_some() {
-                    let mod_str = i.module();
-                    let fn_str = i.name();
-                    if mod_str.len() < SYM_LEN_LIMIT && fn_str.len() < SYM_LEN_LIMIT {
-                        return Some((mod_str, fn_str));
+        self.import_symbols.get_or_init(|| {
+            self.wasmi_module
+                .imports()
+                .filter_map(|i| {
+                    if i.ty().func().is_some() {
+                        let mod_str = i.module();
+                        let fn_str = i.name();
+                        if mod_str.len() < SYM_LEN_LIMIT && fn_str.len() < SYM_LEN_LIMIT {
+                            return Some((mod_str.to_string(), fn_str.to_string()));
+                        }
                     }
-                }
-                None
-            })
-            .collect();
+                    None
+                })
+                .collect()
+        })
+    }
+
+    fn charge_import_symbols(&self, host: &Host) -> Result<&BTreeSet<(String, String)>, HostError> {
+        let symbols = self.import_symbols();
 
         // We approximate the cost of `BTreeSet` with the cost of initializng a
-        // `Vec` with the same elements, and we are doing it after the set has
-        // been created. The element count has been limited/charged during the
-        // parsing phase, so there is no DOS factor. We don't charge for
-        // insertion/lookups, since they should be cheap and number of
-        // operations on the set is limited.
+        // `Vec` with the same elements. The element count has been
+        // limited/charged during the parsing phase, so there is no DOS factor.
+        // We re-charge this on every use to preserve the previous metering.
         Vec::<(&str, &str)>::charge_bulk_init_cpy(symbols.len() as u64, host)?;
-        callback(&symbols)
+        Ok(symbols)
+    }
+
+    pub fn with_import_symbols<T>(
+        &self,
+        host: &Host,
+        callback: impl FnOnce(&BTreeSet<(String, String)>) -> Result<T, HostError>,
+    ) -> Result<T, HostError> {
+        callback(self.charge_import_symbols(host)?)
     }
 
     pub fn make_wasmi_linker(&self, host: &Host) -> Result<wasmi::Linker<Host>, HostError> {
@@ -422,9 +442,17 @@ impl ParsedModule {
         //    to return the same error.
         let _span = tracy_span!("ParsedModule::check_contract_imports_match_host_protocol");
         let ledger_proto = host.with_ledger_info(|li| Ok(li.protocol_version))?;
+        if self.validated_imports_protocol.load(Ordering::Acquire) == ledger_proto {
+            self.charge_import_symbols(host)?;
+            return Ok(());
+        }
+
         self.with_import_symbols(host, |module_symbols| {
                 for hf in HOST_FUNCTIONS {
-                    if !module_symbols.contains(&(hf.mod_str, hf.fn_str)) {
+                    if !module_symbols
+                        .iter()
+                        .any(|(mod_str, fn_str)| mod_str == hf.mod_str && fn_str == hf.fn_str)
+                    {
                         continue;
                     }
                     if let Some(min_proto) = hf.min_proto {
@@ -450,6 +478,8 @@ impl ParsedModule {
                 }
                 Ok(())
             })?;
+        self.validated_imports_protocol
+            .store(ledger_proto, Ordering::Release);
         Ok(())
     }
 

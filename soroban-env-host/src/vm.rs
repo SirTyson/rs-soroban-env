@@ -105,11 +105,14 @@ impl Host {
     pub(crate) fn make_minimal_wasmi_linker_for_symbols<Ctx: ErrorHandler>(
         context: &Ctx,
         engine: &wasmi::Engine,
-        symbols: &BTreeSet<(&str, &str)>,
+        symbols: &BTreeSet<(String, String)>,
     ) -> Result<wasmi::Linker<Host>, HostError> {
         let mut linker = wasmi::Linker::new(&engine);
         for hf in HOST_FUNCTIONS {
-            if symbols.contains(&(hf.mod_str, hf.fn_str)) {
+            if symbols
+                .iter()
+                .any(|(mod_str, fn_str)| mod_str == hf.mod_str && fn_str == hf.fn_str)
+            {
                 context.map_err((hf.wrap)(&mut linker).map_err(|le| wasmi::Error::Linker(le)))?;
             }
         }
