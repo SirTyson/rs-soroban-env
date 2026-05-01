@@ -188,18 +188,14 @@ fn saturating_u64_to_u32(value: u64) -> u32 {
 fn initial_entry_metadata_by_position(
     storage_map: &StorageMap,
     init_entry_metadata: InitialEntryMetadataByKey,
-    storage_idx: Option<&std::collections::HashMap<LedgerKey, usize>>,
     missing_is_error: bool,
 ) -> Result<InitialEntryMetadataByPosition, HostError> {
     let mut metadata_by_pos = vec![None; storage_map.len()];
     for (key, metadata) in init_entry_metadata {
-        let pos = match storage_idx {
-            Some(idx) => idx.get(key.as_ref()).copied(),
-            None => storage_map
-                .map
-                .iter()
-                .position(|(storage_key, _)| storage_key.as_ref() == key.as_ref()),
-        };
+        let pos = storage_map
+            .map
+            .iter()
+            .position(|(storage_key, _)| storage_key.as_ref() == key.as_ref());
         if let Some(pos) = pos {
             if let Some(slot) = metadata_by_pos.get_mut(pos) {
                 *slot = Some(metadata);
@@ -517,7 +513,6 @@ pub fn invoke_host_function<T: AsRef<[u8]>, I: ExactSizeIterator<Item = T>>(
     let init_entry_metadata = initial_entry_metadata_by_position(
         &storage.map,
         init_entry_metadata,
-        storage.enforce_storage_idx.as_deref(),
         true,
     )?;
     let host = Host::with_storage_and_budget(storage, budget.clone());
@@ -894,7 +889,7 @@ pub fn invoke_host_function_in_recording_mode(
         Some(restored_keys)
     };
     let init_entry_metadata =
-        initial_entry_metadata_by_position(&storage.map, init_entry_metadata, None, false)?;
+        initial_entry_metadata_by_position(&storage.map, init_entry_metadata, false)?;
     let (ledger_changes, contract_events) = if invoke_result.is_ok() {
         let mut ledger_changes = get_ledger_changes(
             &budget,

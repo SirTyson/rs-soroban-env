@@ -49,6 +49,6 @@
   "  47 pop VM:6d72e4f7:sym#37 -> Ok(Void)": "",
   "  48 ret create_contract -> Ok(Address(obj#41))": "cpu:7405244940, mem:976180449, objs:-/21@931faac5, vm:-/-, stk:-, auth:-/-",
   "  49 call call(Address(obj#41), Symbol(test), Vec(obj#43))": "cpu:963, mem:96, objs:-/22@198b5e08",
-  "  50 ret call -> Err(Error(Budget, ExceededLimit))": "cpu:5759269, mem:38426869",
-  "  51 end": "cpu:5759269, mem:38426869, prngs:-/9b4a753, objs:-/22@198b5e08, vm:-/-, evt:-, store:-/4@d4ba600c, foot:4@5f0594e7, stk:-, auth:-/-"
+  "  50 ret call -> Err(Error(Budget, ExceededLimit))": "cpu:5758705, mem:38426869",
+  "  51 end": "cpu:5758705, mem:38426869, prngs:-/9b4a753, objs:-/22@198b5e08, vm:-/-, evt:-, store:-/4@d4ba600c, foot:4@5f0594e7, stk:-, auth:-/-"
 }

@@ -7,7 +7,6 @@
 //!   - [Env::put_contract_data](crate::Env::put_contract_data)
 //!   - [Env::del_contract_data](crate::Env::del_contract_data)
 
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::budget::AsBudget;
@@ -134,20 +133,29 @@ impl Footprint {
         ty: AccessType,
         budget: &Budget,
     ) -> Result<(), HostError> {
+        self.enforce_access_with_index(key, ty, budget).map(|_| ())
+    }
+
+    pub(crate) fn enforce_access_with_index(
+        &mut self,
+        key: &Rc<LedgerKey>,
+        ty: AccessType,
+        budget: &Budget,
+    ) -> Result<usize, HostError> {
         // `ExceededLimit` is not the most precise term here, but footprint has
         // to be externally supplied in a similar fashion to budget and it's
         // also representing an execution resource limit (number of ledger
         // entries to access), so it might be considered 'exceeded'.
         // This also helps distinguish access errors from the values simply
         // being  missing from storage (but with a valid footprint).
-        if let Some(existing) = self.0.get::<Rc<LedgerKey>>(key, budget)? {
+        if let Some((idx, existing)) = self.0.get_with_index::<Rc<LedgerKey>>(key, budget)? {
             match (existing, ty) {
-                (AccessType::ReadOnly, AccessType::ReadOnly) => Ok(()),
+                (AccessType::ReadOnly, AccessType::ReadOnly) => Ok(idx),
                 (AccessType::ReadOnly, AccessType::ReadWrite) => {
                     Err((ScErrorType::Storage, ScErrorCode::ExceededLimit).into())
                 }
-                (AccessType::ReadWrite, AccessType::ReadOnly) => Ok(()),
-                (AccessType::ReadWrite, AccessType::ReadWrite) => Ok(()),
+                (AccessType::ReadWrite, AccessType::ReadOnly) => Ok(idx),
+                (AccessType::ReadWrite, AccessType::ReadWrite) => Ok(idx),
             }
         } else {
             Err((ScErrorType::Storage, ScErrorCode::ExceededLimit).into())
@@ -181,17 +189,6 @@ pub struct Storage {
     pub footprint: Footprint,
     pub(crate) mode: FootprintMode,
     pub map: StorageMap,
-    /// PoC H002: side index from `LedgerKey` to its position in
-    /// `footprint.0.map`. Built only by `with_enforcing_footprint_and_map`;
-    /// `None` for recording-mode or test-constructed `Storage`s, which use
-    /// the legacy binary-search lookup path.
-    pub(crate) enforce_footprint_idx: Option<Rc<HashMap<LedgerKey, usize>>>,
-    /// PoC H002: side index from `LedgerKey` to its position in `map.map`.
-    /// Built only by `with_enforcing_footprint_and_map`. The storage map's
-    /// key set is fixed at construction (declared by the footprint) and only
-    /// values change in enforcing mode, so positions remain valid across
-    /// in-place replaces.
-    pub(crate) enforce_storage_idx: Option<Rc<HashMap<LedgerKey, usize>>>,
 }
 
 /// Helper struct holding common state for TTL extension operations.
@@ -200,6 +197,7 @@ struct TtlExtensionInfo {
     old_live_until: u32,
     current_ttl: u32,
     max_live_until: u32,
+    storage_pos: Option<usize>,
 }
 
 impl TtlExtensionInfo {
@@ -243,27 +241,10 @@ impl Storage {
     /// given [Footprint] and a storage map populated with all the keys
     /// listed in the [Footprint].
     pub fn with_enforcing_footprint_and_map(footprint: Footprint, map: StorageMap) -> Self {
-        // PoC H002: precompute side indices that map each LedgerKey to its
-        // position in the underlying sorted vector. The footprint and storage
-        // maps are immutable in their key set during enforcing-mode execution
-        // (the storage map is preinitialized with all footprint keys, and
-        // writes only replace existing entries), so these indices remain valid
-        // for the lifetime of this Storage.
-        let mut fp_idx: HashMap<LedgerKey, usize> =
-            HashMap::with_capacity(footprint.0.map.len());
-        for (i, (k, _)) in footprint.0.map.iter().enumerate() {
-            fp_idx.insert((**k).clone(), i);
-        }
-        let mut st_idx: HashMap<LedgerKey, usize> = HashMap::with_capacity(map.map.len());
-        for (i, (k, _)) in map.map.iter().enumerate() {
-            st_idx.insert((**k).clone(), i);
-        }
         Self {
             mode: FootprintMode::Enforcing,
             footprint,
             map,
-            enforce_footprint_idx: Some(Rc::new(fp_idx)),
-            enforce_storage_idx: Some(Rc::new(st_idx)),
         }
     }
 
@@ -275,49 +256,7 @@ impl Storage {
             mode: FootprintMode::Recording(src),
             footprint: Footprint::default(),
             map: Default::default(),
-            enforce_footprint_idx: None,
-            enforce_storage_idx: None,
         }
-    }
-
-    // PoC H002: enforcing-mode footprint access check using the precomputed
-    // side index when available. Falls back to the legacy
-    // `Footprint::enforce_access` (full binary search) when the index is
-    // missing or the underlying map size has changed (e.g., a test directly
-    // mutated `storage.footprint.0`).
-    fn enforce_access_indexed(
-        &mut self,
-        key: &Rc<LedgerKey>,
-        ty: AccessType,
-        budget: &Budget,
-    ) -> Result<(), HostError> {
-        if let Some(idx) = &self.enforce_footprint_idx {
-            if idx.len() == self.footprint.0.map.len() {
-                if let Some(&pos) = idx.get(key.as_ref()) {
-                    if let Some(existing) =
-                        self.footprint.0.get_at_known_position(pos, budget)?
-                    {
-                        return match (existing, ty) {
-                            (AccessType::ReadOnly, AccessType::ReadOnly) => Ok(()),
-                            (AccessType::ReadOnly, AccessType::ReadWrite) => Err((
-                                ScErrorType::Storage,
-                                ScErrorCode::ExceededLimit,
-                            )
-                                .into()),
-                            (AccessType::ReadWrite, AccessType::ReadOnly) => Ok(()),
-                            (AccessType::ReadWrite, AccessType::ReadWrite) => Ok(()),
-                        };
-                    }
-                    return Err((ScErrorType::Storage, ScErrorCode::InternalError).into());
-                } else {
-                    // Match the legacy "key missing" budget profile: a single
-                    // `find` call's `charge_binsearch`, no access charge.
-                    self.footprint.0.charge_lookup(budget)?;
-                    return Err((ScErrorType::Storage, ScErrorCode::ExceededLimit).into());
-                }
-            }
-        }
-        self.footprint.enforce_access(key, ty, budget)
     }
 
     // Helper function the next 3 `get`-variants funnel into.
@@ -325,30 +264,23 @@ impl Storage {
         &mut self,
         key: &Rc<LedgerKey>,
         host: &Host,
-    ) -> Result<Option<EntryWithLiveUntil>, HostError> {
+    ) -> Result<(Option<EntryWithLiveUntil>, Option<usize>), HostError> {
         let _span = tracy_span!("storage get");
         Self::check_supported_ledger_key_type(key)?;
-        self.prepare_read_only_access(key, host)?;
-        // PoC H002: indexed fast path for the storage map lookup.
-        if let Some(idx) = &self.enforce_storage_idx {
-            if idx.len() == self.map.map.len() {
-                if let Some(&pos) = idx.get(key.as_ref()) {
-                    return match self.map.get_at_known_position(pos, host.budget_ref())? {
-                        None => Err((ScErrorType::Storage, ScErrorCode::InternalError).into()),
-                        Some(pair_option) => Ok(pair_option.clone()),
-                    };
-                }
-                // Index says key is absent; matches legacy `find` -> `Ok(None)`
-                // budget profile (single `charge_binsearch`, no access charge).
-                self.map.charge_lookup(host.budget_ref())?;
-                return Err((ScErrorType::Storage, ScErrorCode::InternalError).into());
-            }
+        let storage_pos = self.prepare_read_only_access(key, host)?;
+        if let Some(pos) = storage_pos {
+            let (storage_key, pair_option) = self
+                .map
+                .get_at_index(pos, host.budget_ref())
+                .map_err(|_| HostError::from((ScErrorType::Storage, ScErrorCode::InternalError)))?;
+            debug_assert_eq!(storage_key.as_ref(), key.as_ref());
+            return Ok((pair_option.clone(), Some(pos)));
         }
         match self.map.get::<Rc<LedgerKey>>(key, host.budget_ref())? {
             // Key has to be in the storage map at this point due to
             // `prepare_read_only_access`.
             None => Err((ScErrorType::Storage, ScErrorCode::InternalError).into()),
-            Some(pair_option) => Ok(pair_option.clone()),
+            Some(pair_option) => Ok((pair_option.clone(), None)),
         }
     }
 
@@ -360,8 +292,19 @@ impl Storage {
     ) -> Result<Option<EntryWithLiveUntil>, HostError> {
         let res = self
             .try_get_full_helper(key, host)
+            .map(|(entry, _)| entry)
             .map_err(|e| host.decorate_storage_error(e, key.as_ref(), key_val))?;
         Ok(res)
+    }
+
+    fn try_get_full_with_pos(
+        &mut self,
+        key: &Rc<LedgerKey>,
+        host: &Host,
+        key_val: Option<Val>,
+    ) -> Result<(Option<EntryWithLiveUntil>, Option<usize>), HostError> {
+        self.try_get_full_helper(key, host)
+            .map_err(|e| host.decorate_storage_error(e, key.as_ref(), key_val))
     }
 
     pub(crate) fn get(
@@ -430,28 +373,28 @@ impl Storage {
         self.handle_maybe_expired_entry(&key, host)?;
 
         let ty = AccessType::ReadWrite;
-        match &self.mode {
+        let storage_pos = match &self.mode {
             #[cfg(any(test, feature = "recording_mode"))]
             FootprintMode::Recording(_) => {
                 self.footprint.record_access(key, ty, host.budget_ref())?;
+                None
             }
             FootprintMode::Enforcing => {
-                self.enforce_access_indexed(key, ty, host.budget_ref())?;
+                Some(
+                    self.footprint
+                        .enforce_access_with_index(key, ty, host.budget_ref())?,
+                )
             }
         };
-        // PoC H002: indexed fast path for the storage map replace.
-        if let Some(idx) = self.enforce_storage_idx.clone() {
-            if idx.len() == self.map.map.len() {
-                if let Some(&pos) = idx.get(key.as_ref()) {
-                    self.map = self.map.insert_at_known_position(
-                        pos,
-                        Rc::clone(key),
-                        val,
-                        host.budget_ref(),
-                    )?;
-                    return Ok(());
-                }
-            }
+        if let Some(pos) = storage_pos {
+            debug_assert_eq!(
+                self.map.map.get(pos).map(|(k, _)| k.as_ref()),
+                Some(key.as_ref())
+            );
+            self.map =
+                self.map
+                    .insert_at_known_position(pos, Rc::clone(key), val, host.budget_ref())?;
+            return Ok(());
         }
         self.map = self.map.insert(Rc::clone(key), val, host.budget_ref())?;
         Ok(())
@@ -544,7 +487,9 @@ impl Storage {
 
         // Extending deleted/non-existing/out-of-footprint entries will result in
         // an error.
-        let (entry, old_live_until) = self.get_with_live_until_ledger(key, host, key_val)?;
+        let (entry_with_live_until, storage_pos) = self.try_get_full_with_pos(key, host, key_val)?;
+        let (entry, old_live_until) = entry_with_live_until
+            .ok_or_else(|| (ScErrorType::Storage, ScErrorCode::MissingValue))?;
         let old_live_until = old_live_until.ok_or_else(|| {
             host.err(
                 ScErrorType::Storage,
@@ -594,6 +539,7 @@ impl Storage {
             old_live_until,
             current_ttl,
             max_live_until,
+            storage_pos,
         })
     }
 
@@ -606,19 +552,18 @@ impl Storage {
         new_live_until: u32,
     ) -> Result<(), HostError> {
         if new_live_until > ttl_ext_info.old_live_until {
-            // PoC H002: indexed fast path for the storage map replace.
-            if let Some(idx) = self.enforce_storage_idx.clone() {
-                if idx.len() == self.map.map.len() {
-                    if let Some(&pos) = idx.get(key.as_ref()) {
-                        self.map = self.map.insert_at_known_position(
-                            pos,
-                            key,
-                            Some((ttl_ext_info.entry, Some(new_live_until))),
-                            host.budget_ref(),
-                        )?;
-                        return Ok(());
-                    }
-                }
+            if let Some(pos) = ttl_ext_info.storage_pos {
+                debug_assert_eq!(
+                    self.map.map.get(pos).map(|(k, _)| k.as_ref()),
+                    Some(key.as_ref())
+                );
+                self.map = self.map.insert_at_known_position(
+                    pos,
+                    key,
+                    Some((ttl_ext_info.entry, Some(new_live_until))),
+                    host.budget_ref(),
+                )?;
+                return Ok(());
             }
             self.map = self.map.insert(
                 key,
@@ -808,7 +753,7 @@ impl Storage {
         &mut self,
         key: &Rc<LedgerKey>,
         host: &Host,
-    ) -> Result<(), HostError> {
+    ) -> Result<Option<usize>, HostError> {
         let ty = AccessType::ReadOnly;
         match self.mode {
             #[cfg(any(test, feature = "recording_mode"))]
@@ -825,12 +770,14 @@ impl Storage {
                 }
                 self.footprint.record_access(key, ty, host.budget_ref())?;
                 self.handle_maybe_expired_entry(key, host)?;
+                Ok(None)
             }
             FootprintMode::Enforcing => {
-                self.enforce_access_indexed(key, ty, host.budget_ref())?;
+                self.footprint
+                    .enforce_access_with_index(key, ty, host.budget_ref())
+                    .map(Some)
             }
-        };
-        Ok(())
+        }
     }
 
     #[cfg(any(test, feature = "recording_mode"))]

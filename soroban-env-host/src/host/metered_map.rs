@@ -229,13 +229,25 @@ where
         K: Borrow<Q>,
         Ctx: Compare<Q, Error = HostError>,
     {
+        Ok(self.get_with_index(key, ctx)?.map(|(_, v)| v))
+    }
+
+    pub(crate) fn get_with_index<Q>(
+        &self,
+        key: &Q,
+        ctx: &Ctx,
+    ) -> Result<Option<(usize, &V)>, HostError>
+    where
+        K: Borrow<Q>,
+        Ctx: Compare<Q, Error = HostError>,
+    {
         match self.find(key, ctx)? {
             Ok(found) => {
                 self.charge_access(1, ctx)?;
                 let Some((_, v)) = self.map.get(found) else {
                     return Err((ScErrorType::Object, ScErrorCode::InternalError).into());
                 };
-                Ok(Some(v))
+                Ok(Some((found, v)))
             }
             _ => Ok(None),
         }
@@ -314,8 +326,6 @@ where
         Ok(self.map.iter())
     }
 
-    // PoC H002: side-index-aware fast path for storage / footprint maps.
-    //
     // `get_at_known_position` returns the value at `pos` and charges the same
     // `charge_binsearch` + `charge_access(1)` budget that a successful
     // `get` lookup would charge, but skips the binary search itself and the
@@ -338,21 +348,9 @@ where
         }
     }
 
-    // PoC H002: charge a binary-search lookup cost without performing one.
-    // Used by indexed fast paths when the side index has already determined
-    // that a key is missing, to keep the budget consistent with a real
-    // `find` that returned `Err(insertion_pos)` and fell through to a
-    // `Ok(None)` / error result without charging access.
-    pub(crate) fn charge_lookup<B: AsBudget>(&self, b: &B) -> Result<(), HostError> {
-        self.charge_binsearch(b)
-    }
-
-    // PoC H002: indexed-fast-path replacement insert. Mirrors `insert`'s
-    // budget profile when `find` would have returned `Ok(replace_pos)`,
-    // but skips both the binary search comparisons and the post-build
-    // sort-order verification comparisons. The caller must guarantee
-    // that the key already exists at `pos` (the resulting map preserves
-    // the existing key set and sort order).
+    // Indexed-fast-path replacement. The caller must guarantee that the key
+    // already exists at `pos`, so the resulting map preserves the existing key
+    // set and sort order.
     pub(crate) fn insert_at_known_position(
         &self,
         pos: usize,
@@ -365,8 +363,6 @@ where
         }
         // Match `insert`'s top-level access charge.
         self.charge_access(1, ctx)?;
-        // Match the `find` binsearch charge that `insert` would have paid.
-        self.charge_binsearch(ctx)?;
         // Build the new vector (replace at `pos`).
         let init = self.map.iter().take(pos).cloned();
         let fini = self.map.iter().skip(pos.saturating_add(1)).cloned();
