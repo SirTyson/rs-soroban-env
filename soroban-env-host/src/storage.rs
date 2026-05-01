@@ -439,16 +439,12 @@ impl Storage {
                 self.enforce_access_indexed(key, ty, host.budget_ref())?;
             }
         };
-        // PoC H002: indexed fast path for the storage map replace.
-        if let Some(idx) = self.enforce_storage_idx.clone() {
+        // PoC H002: indexed fast path for value-only storage map replacement.
+        if let Some(idx) = &self.enforce_storage_idx {
             if idx.len() == self.map.map.len() {
                 if let Some(&pos) = idx.get(key.as_ref()) {
-                    self.map = self.map.insert_at_known_position(
-                        pos,
-                        Rc::clone(key),
-                        val,
-                        host.budget_ref(),
-                    )?;
+                    self.map
+                        .replace_at_known_position(pos, val, host.budget_ref())?;
                     return Ok(());
                 }
             }
@@ -606,13 +602,12 @@ impl Storage {
         new_live_until: u32,
     ) -> Result<(), HostError> {
         if new_live_until > ttl_ext_info.old_live_until {
-            // PoC H002: indexed fast path for the storage map replace.
-            if let Some(idx) = self.enforce_storage_idx.clone() {
+            // PoC H002: indexed fast path for value-only storage map replacement.
+            if let Some(idx) = &self.enforce_storage_idx {
                 if idx.len() == self.map.map.len() {
                     if let Some(&pos) = idx.get(key.as_ref()) {
-                        self.map = self.map.insert_at_known_position(
+                        self.map.replace_at_known_position(
                             pos,
-                            key,
                             Some((ttl_ext_info.entry, Some(new_live_until))),
                             host.budget_ref(),
                         )?;

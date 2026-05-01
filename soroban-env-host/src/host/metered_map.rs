@@ -383,6 +383,44 @@ where
         m.charge_scan(ctx)?;
         Ok(m)
     }
+
+    // PoC H002: indexed-fast-path in-place replacement. This is for maps whose
+    // key set is known to be fixed by an external invariant (enforcing storage
+    // is pre-populated from its footprint). It preserves canonical key order
+    // and avoids rebuilding the whole sorted vector for a value-only update.
+    //
+    // Metering is sequenced to match the legacy `insert` path exactly:
+    //   1. charge_access(1)               (legacy: top of `insert`)
+    //   2. charge_binsearch               (legacy: inside `find`)
+    //   3. write the new value in place   (legacy: collect new Vec)
+    //   4. charge_deep_clone of self.map  (legacy: charge_deep_clone of new Vec)
+    //   5. charge_scan                    (legacy: inside `from_map`)
+    //
+    // Charging the deep clone *after* applying the new value ensures that any
+    // value-dependent substructure charge is taken against the post-write
+    // contents — identical to legacy `from_exact_iter`, which charges the
+    // freshly built vector containing the new value. Storage values today are
+    // shallow so this is presently size-only, but the ordering keeps the fast
+    // path correct if substructure charges later become value-dependent.
+    pub(crate) fn replace_at_known_position(
+        &mut self,
+        pos: usize,
+        value: V,
+        ctx: &Ctx,
+    ) -> Result<(), HostError> {
+        if pos >= self.map.len() {
+            return Err((ScErrorType::Object, ScErrorCode::InternalError).into());
+        }
+        self.charge_access(1, ctx)?;
+        self.charge_binsearch(ctx)?;
+        let Some((_, stored_value)) = self.map.get_mut(pos) else {
+            return Err((ScErrorType::Object, ScErrorCode::InternalError).into());
+        };
+        *stored_value = value;
+        self.map.charge_deep_clone(ctx.as_budget())?;
+        self.charge_scan(ctx)?;
+        Ok(())
+    }
 }
 
 impl<K, V> MeteredOrdMap<K, V, Host>
