@@ -1,9 +1,36 @@
 use crate::{
+    host::MIN_LEDGER_PROTOCOL_VERSION,
     meta::INTERFACE_VERSION,
     testutils::{generate_account_id, generate_bytes_array, wasm as wasm_util},
     xdr::{ScErrorCode, ScErrorType},
     AddressObject, Env, Host, HostError, LedgerInfo, Symbol, Val, WasmiMarshal,
 };
+
+#[test]
+fn ledger_protocol_controls_coalesced_host_metering() -> Result<(), HostError> {
+    let host = Host::test_host_with_recording_footprint();
+    let mut li = LedgerInfo::default();
+
+    li.protocol_version = MIN_LEDGER_PROTOCOL_VERSION;
+    host.set_ledger_info(li.clone())?;
+    assert!(!host.budget_cloned().coalesced_host_metering()?);
+
+    if INTERFACE_VERSION.protocol > MIN_LEDGER_PROTOCOL_VERSION {
+        li.protocol_version = INTERFACE_VERSION.protocol;
+        host.set_ledger_info(li)?;
+        assert!(host.budget_cloned().coalesced_host_metering()?);
+    }
+
+    Ok(())
+}
+
+// Note: a `#[cfg(feature = "next")]` runtime assertion of reachability would
+// be unreachable here because `check-sorobans` runs `cargo test --features
+// testutils` only and does not propagate the host crate's `next` feature.
+// The reachability requirement is instead enforced at compile time by the
+// `const _: ()` assertion in `host.rs`, which fails the production rlib build
+// (which IS built with `--features next`) if `INTERFACE_VERSION.protocol`
+// ever stops exceeding `MIN_LEDGER_PROTOCOL_VERSION`.
 
 #[test]
 fn ledger_protocol_greater_than_env_protocol_should_fail() -> Result<(), HostError> {

@@ -465,14 +465,21 @@ impl Host {
     where
         F: FnOnce(&HostObject) -> Result<U, HostError>,
     {
-        let _span = tracy_span!("visit host object");
-        // `VisitObject` covers the cost of visiting an object. The actual cost
-        // of the closure needs to be covered by the caller. Although each visit
-        // does small amount of work -- getting the object handling and indexing
-        // into the host object buffer, almost too little to bother charging for
-        // -- it is ubiquitous and therefore we charge budget here for safety /
-        // future proofing.
-        self.charge_budget(ContractCostType::VisitObject, None)?;
+        let coalesced_host_metering = self.budget_ref().coalesced_host_metering()?;
+        let _span = if coalesced_host_metering {
+            None
+        } else {
+            Some(tracy_span!("visit host object"))
+        };
+        if !coalesced_host_metering {
+            // `VisitObject` covers the cost of visiting an object. The actual cost
+            // of the closure needs to be covered by the caller. Although each visit
+            // does small amount of work -- getting the object handling and indexing
+            // into the host object buffer, almost too little to bother charging for
+            // -- it is ubiquitous and therefore we charge budget here for safety /
+            // future proofing.
+            self.charge_budget(ContractCostType::VisitObject, None)?;
+        }
         let r = self.try_borrow_objects()?;
         let obj: Object = obj.into();
         let handle: u32 = obj.get_handle();

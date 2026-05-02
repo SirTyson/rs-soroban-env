@@ -202,6 +202,7 @@ pub(crate) struct BudgetImpl {
     /// For the purpose of calibration and reporting; not used for budget-limiting nor does it affect consensus
     tracker: BudgetTracker,
     is_in_shadow_mode: bool,
+    coalesced_host_metering: bool,
     fuel_costs: wasmi::FuelCosts,
     depth_limit: u32,
 }
@@ -219,6 +220,7 @@ impl BudgetImpl {
             mem_bytes: BudgetDimension::try_from_config(mem_cost_params, mem_limit)?,
             tracker: BudgetTracker::default(),
             is_in_shadow_mode: false,
+            coalesced_host_metering: false,
             fuel_costs: load_calibrated_fuel_costs(),
             depth_limit: DEFAULT_HOST_DEPTH_LIMIT,
         })
@@ -391,6 +393,7 @@ impl Default for BudgetImpl {
             mem_bytes: BudgetDimension::default(),
             tracker: Default::default(),
             is_in_shadow_mode: false,
+            coalesced_host_metering: false,
             fuel_costs: load_calibrated_fuel_costs(),
             depth_limit: DEFAULT_HOST_DEPTH_LIMIT,
         };
@@ -1401,6 +1404,17 @@ impl Budget {
     /// passed is consistent with the inherent model underneath.
     pub fn charge(&self, ty: ContractCostType, input: Option<u64>) -> Result<(), HostError> {
         self.0.try_borrow_mut_or_err()?.charge(ty, 1, input)
+    }
+
+    pub(crate) fn set_coalesced_host_metering(&self, enabled: bool) -> Result<(), HostError> {
+        self.with_mut_budget(|mut budget| {
+            budget.coalesced_host_metering = enabled;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn coalesced_host_metering(&self) -> Result<bool, HostError> {
+        Ok(self.0.try_borrow_or_err()?.coalesced_host_metering)
     }
 
     /// Batched `ValSer` charge keyed by `(input_len, count)` pairs. Equivalent

@@ -88,6 +88,27 @@ pub struct CoverageScoreboard {
 // The soroban 26.x host only supports protocol 26 and later.
 pub(crate) const MIN_LEDGER_PROTOCOL_VERSION: u32 = 26;
 
+// Compile-time reachability check for the protocol-gated coalesced
+// host-metering optimization. When the host crate is built with the `next`
+// cargo feature (which the outer stellar-core build propagates whenever it is
+// configured with `--enable-next-protocol-version-unsafe-for-production`), the
+// gate in `Host::set_ledger_info` enables coalesced metering exactly when the
+// active ledger protocol exceeds `MIN_LEDGER_PROTOCOL_VERSION`. If
+// `INTERFACE_VERSION.protocol` ever stops being strictly greater than
+// `MIN_LEDGER_PROTOCOL_VERSION` under the `next` feature, the gate becomes
+// unreachable and the production benchmark would silently fall back to the
+// p26 micro-charge path. The const assertion below makes that misconfiguration
+// a compile-time error in the rlib that the benchmark actually links against.
+#[cfg(feature = "next")]
+const _: () = {
+    assert!(
+        crate::meta::INTERFACE_VERSION.protocol > MIN_LEDGER_PROTOCOL_VERSION,
+        "next-protocol build must expose a protocol number greater than \
+         MIN_LEDGER_PROTOCOL_VERSION so the coalesced-host-metering gate is \
+         reachable in the benchmarked configuration"
+    );
+};
+
 #[derive(Clone, Default)]
 struct HostImpl {
     module_cache: RefCell<Option<ModuleCache>>,
@@ -554,7 +575,10 @@ impl Host {
 
     pub fn set_ledger_info(&self, info: LedgerInfo) -> Result<(), HostError> {
         *self.try_borrow_ledger_mut()? = Some(info);
-        self.check_ledger_protocol_supported()
+        self.check_ledger_protocol_supported()?;
+        self.budget_ref().set_coalesced_host_metering(
+            self.get_ledger_protocol_version()? > MIN_LEDGER_PROTOCOL_VERSION,
+        )
     }
 
     pub(crate) fn check_ledger_protocol_supported(&self) -> Result<(), HostError> {

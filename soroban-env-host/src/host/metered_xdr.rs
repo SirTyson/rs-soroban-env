@@ -70,6 +70,17 @@ pub fn metered_write_xdr(
     w: &mut Vec<u8>,
 ) -> Result<(), HostError> {
     let _span = tracy_span!("write xdr");
+    if budget.coalesced_host_metering()? {
+        let start_len = w.len();
+        let mut limited = Limited::new(w, DEFAULT_XDR_RW_LIMITS);
+        let write_res = obj.write_xdr(&mut limited);
+        let bytes_written = limited.inner.len().saturating_sub(start_len);
+        if bytes_written != 0 {
+            budget.charge(ContractCostType::ValSer, Some(bytes_written as u64))?;
+        }
+        return write_res.map_err(|_| (ScErrorType::Budget, ScErrorCode::ExceededLimit).into());
+    }
+
     let mw = MeteredWrite {
         histogram: Vec::with_capacity(16),
         w,
