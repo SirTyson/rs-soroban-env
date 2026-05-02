@@ -14,10 +14,10 @@ use crate::{
     storage::Storage,
     xdr::{
         int128_helpers, AccountEntry, AccountEntryExt, AccountEntryExtensionV1Ext, AccountFlags,
-        AccountId, Asset, ContractDataDurability, ContractDataEntry, ExtensionPoint, Int128Parts,
-        LedgerEntry, LedgerEntryData, LedgerEntryExt, LedgerKey, ScAddress, ScErrorCode,
-        ScErrorType, ScMap, ScMapEntry, ScSymbol, ScVal, ScVec, SequenceNumber, Thresholds,
-        TrustLineAsset, TrustLineEntry, TrustLineEntryExt, TrustLineFlags,
+        AccountId, Asset, ContractDataDurability, ContractDataEntry, ContractId, ExtensionPoint,
+        Int128Parts, LedgerEntry, LedgerEntryData, LedgerEntryExt, LedgerKey, ScAddress,
+        ScErrorCode, ScErrorType, ScMap, ScMapEntry, ScSymbol, ScVal, ScVec, SequenceNumber,
+        Thresholds, TrustLineAsset, TrustLineEntry, TrustLineEntryExt, TrustLineFlags,
     },
     ErrorHandler, Host, HostError,
 };
@@ -147,16 +147,15 @@ fn balance_value_from_scval(e: &Host, scv: &ScVal) -> Result<BalanceValue, HostE
     })
 }
 
-fn read_contract_balance(
-    e: &Host,
-    key: &Rc<LedgerKey>,
-) -> Result<Option<BalanceValue>, HostError> {
+fn read_contract_balance(e: &Host, key: &Rc<LedgerKey>) -> Result<Option<BalanceValue>, HostError> {
     let entry = {
         let mut storage = e.try_borrow_storage_mut()?;
         storage.try_get(key, e, None)?
     };
     match entry.as_ref().map(|entry| &entry.data) {
-        Some(LedgerEntryData::ContractData(data)) => Ok(Some(balance_value_from_scval(e, &data.val)?)),
+        Some(LedgerEntryData::ContractData(data)) => {
+            Ok(Some(balance_value_from_scval(e, &data.val)?))
+        }
         Some(_) => Err(e.err(
             ScErrorType::Storage,
             ScErrorCode::InternalError,
@@ -165,6 +164,14 @@ fn read_contract_balance(
         )),
         None => Ok(None),
     }
+}
+
+fn read_contract_balance_for_contract(
+    e: &Host,
+    id: &ContractId,
+) -> Result<Option<BalanceValue>, HostError> {
+    let key = contract_balance_ledger_key(e, ScAddress::Contract(id.metered_clone(e)?))?;
+    read_contract_balance(e, &key)
 }
 
 fn extend_contract_balance_ttl(e: &Host, key: Rc<LedgerKey>) -> Result<(), HostError> {
@@ -277,18 +284,24 @@ fn write_contract_balance(
     Ok(())
 }
 
-// Metering: covered by components.
-pub(crate) fn receive_balance(e: &Host, addr: Address, amount: i128) -> Result<(), HostError> {
-    if !is_authorized(e, addr.metered_clone(e)?)? {
-        return Err(e.error(
+fn check_balance_authorized(e: &Host, authorized: bool) -> Result<(), HostError> {
+    if authorized {
+        Ok(())
+    } else {
+        Err(e.error(
             ContractError::BalanceDeauthorizedError.into(),
             "balance is deauthorized",
             &[],
-        ));
+        ))
     }
+}
 
+// Metering: covered by components.
+pub(crate) fn receive_balance(e: &Host, addr: Address, amount: i128) -> Result<(), HostError> {
     match addr.to_sc_address()? {
         ScAddress::Account(acc_id) => {
+            check_balance_authorized(e, is_authorized(e, addr.metered_clone(e)?)?)?;
+
             let i64_amount = i64::try_from(amount).map_err(|_| {
                 e.error(
                     ContractError::OverflowError.into(),
@@ -299,11 +312,11 @@ pub(crate) fn receive_balance(e: &Host, addr: Address, amount: i128) -> Result<(
             Ok(transfer_classic_balance(e, acc_id, i64_amount, &addr)?)
         }
         ScAddress::Contract(id) => {
-            let key = contract_balance_ledger_key(e, ScAddress::Contract(id.metered_clone(e)?))?;
-            let mut balance = if let Some(balance) = read_contract_balance(e, &key)? {
+            let mut balance = if let Some(balance) = read_contract_balance_for_contract(e, &id)? {
+                check_balance_authorized(e, balance.authorized)?;
                 balance
             } else {
-                // balance passed the authorization check at the top of this function, so write true.
+                check_balance_authorized(e, !is_asset_auth_required(e)?)?;
                 BalanceValue {
                     amount: 0,
                     authorized: true,
@@ -394,15 +407,56 @@ pub(crate) fn spend_balance_no_authorization_check(
 
 // Metering: covered by components.
 pub(crate) fn spend_balance(e: &Host, addr: Address, amount: i128) -> Result<(), HostError> {
-    if !is_authorized(e, addr.metered_clone(e)?)? {
-        return Err(e.error(
-            ContractError::BalanceDeauthorizedError.into(),
-            "balance is deauthorized",
-            &[],
-        ));
-    }
+    match addr.to_sc_address()? {
+        ScAddress::Account(_) => {
+            check_balance_authorized(e, is_authorized(e, addr.metered_clone(e)?)?)?;
+            spend_balance_no_authorization_check(e, addr, amount)
+        }
+        ScAddress::Contract(id) => {
+            if let Some(mut balance) = read_contract_balance_for_contract(e, &id)? {
+                check_balance_authorized(e, balance.authorized)?;
 
-    spend_balance_no_authorization_check(e, addr, amount)
+                if balance.amount < amount {
+                    Err(err!(
+                        e,
+                        ContractError::BalanceError,
+                        "balance is not sufficient to spend",
+                        balance,
+                        amount
+                    ))
+                } else {
+                    let new_balance = balance.amount.checked_sub(amount).ok_or_else(|| {
+                        e.error(
+                            ContractError::OverflowError.into(),
+                            "balance overflow in spend_balance_no_authorization_check",
+                            &[],
+                        )
+                    })?;
+                    balance.amount = new_balance;
+
+                    write_contract_balance(e, addr, balance, &id)
+                }
+            } else {
+                check_balance_authorized(e, !is_asset_auth_required(e)?)?;
+                if amount > 0 {
+                    Err(err!(
+                        e,
+                        ContractError::BalanceError,
+                        "zero balance is not sufficient to spend",
+                        amount
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        _ => Err(e.err(
+            ScErrorType::Object,
+            ScErrorCode::InternalError,
+            "Unexpected ScAddress type",
+            &[addr.as_object().into()],
+        )),
+    }
 }
 
 // Metering: covered by components.
