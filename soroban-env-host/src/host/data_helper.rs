@@ -68,6 +68,10 @@ impl Host {
             // ops using `with_instance_storage` and RW for potentially
             // mutating ops using `with_mut_instance_storage`).
             storage.is_modified = true;
+            self.with_current_sac_metadata_cache_mut(|cache| {
+                cache.invalidate();
+                Ok(())
+            })?;
             f(storage)
         })
     }

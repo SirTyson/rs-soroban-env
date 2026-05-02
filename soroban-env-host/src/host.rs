@@ -117,6 +117,7 @@ struct HostImpl {
     objects: RefCell<Vec<HostObject>>,
     storage: RefCell<Storage>,
     context_stack: RefCell<Vec<Context>>,
+    sac_metadata_cache_stack: RefCell<Vec<frame::SacInstanceMetadataCache>>,
     // Note: budget is refcounted and is _not_ deep-cloned when you call HostImpl::deep_clone,
     // mainly because it's not really possible to achieve (the same budget is connected to many
     // metered sub-objects) but also because it's plausible that the person calling deep_clone
@@ -260,6 +261,12 @@ impl_checked_borrow_helpers!(
     try_borrow_context_stack_mut
 );
 impl_checked_borrow_helpers!(
+    sac_metadata_cache_stack,
+    Vec<frame::SacInstanceMetadataCache>,
+    try_borrow_sac_metadata_cache_stack,
+    try_borrow_sac_metadata_cache_stack_mut
+);
+impl_checked_borrow_helpers!(
     events,
     InternalEventsBuffer,
     try_borrow_events,
@@ -383,6 +390,7 @@ impl Host {
             objects: Default::default(),
             storage: RefCell::new(storage),
             context_stack: Default::default(),
+            sac_metadata_cache_stack: Default::default(),
             budget,
             events: Default::default(),
             authorization_manager: RefCell::new(

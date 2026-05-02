@@ -190,6 +190,9 @@ pub(crate) fn set_metadata(e: &Host) -> Result<(), HostError> {
 }
 
 pub(crate) fn read_name(e: &Host) -> Result<String, HostError> {
+    if let Some(name) = e.cached_sac_metadata_name()? {
+        return name.try_into_val(e);
+    }
     let key = SymbolSmall::try_from_str(METADATA_KEY)?;
     let metadata: StellarAssetContractMetadata = e
         .get_contract_data(key.try_into_val(e)?, StorageType::Instance)?

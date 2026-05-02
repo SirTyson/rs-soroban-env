@@ -18,6 +18,9 @@ pub(crate) fn write_asset_info(e: &Host, asset_info: AssetInfo) -> Result<(), Ho
 }
 
 pub(crate) fn read_asset_info(e: &Host) -> Result<AssetInfo, HostError> {
+    if let Some(rv) = e.cached_sac_asset_info()? {
+        return rv.try_into_val(e);
+    }
     let key = InstanceDataKey::AssetInfo;
     let rv = e.get_contract_data(key.try_into_val(e)?, StorageType::Instance)?;
     rv.try_into_val(e)

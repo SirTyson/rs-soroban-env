@@ -1,10 +1,14 @@
 use crate::{
     auth::AuthorizationManagerSnapshot,
     budget::AsBudget,
+    builtin_contracts::stellar_asset_contract::{
+        metadata::StellarAssetContractMetadata, storage_types::InstanceDataKey,
+    },
     err,
     host::{
         metered_clone::{MeteredClone, MeteredContainer},
         prng::Prng,
+        MIN_LEDGER_PROTOCOL_VERSION,
     },
     storage::{InstanceStorageMap, StorageMap},
     xdr::{
@@ -12,8 +16,8 @@ use crate::{
         HostFunction, HostFunctionType, ScAddress, ScContractInstance, ScErrorCode, ScErrorType,
         ScVal,
     },
-    AddressObject, Error, ErrorHandler, Host, HostError, Object, Symbol, SymbolStr, TryFromVal,
-    TryIntoVal, Val, Vm, DEFAULT_HOST_DEPTH_LIMIT,
+    AddressObject, Error, ErrorHandler, Host, HostError, Object, Symbol, SymbolSmall, SymbolStr,
+    TryFromVal, TryIntoVal, Val, Vm, DEFAULT_HOST_DEPTH_LIMIT,
 };
 
 #[cfg(any(test, feature = "testutils"))]
@@ -95,6 +99,27 @@ pub(crate) struct Context {
     pub(crate) frame: Frame,
     pub(crate) prng: Option<Prng>,
     pub(crate) storage: Option<InstanceStorageMap>,
+}
+
+#[derive(Clone, Default, Hash)]
+pub(crate) struct SacInstanceMetadataCache {
+    asset_info: Option<Val>,
+    metadata_name: Option<Val>,
+    invalidated: bool,
+}
+
+impl SacInstanceMetadataCache {
+    pub(crate) fn invalidate(&mut self) {
+        self.asset_info = None;
+        self.metadata_name = None;
+        self.invalidated = true;
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SacInstanceMetadataField {
+    AssetInfo,
+    MetadataName,
 }
 
 pub(crate) struct CallParams {
@@ -200,7 +225,12 @@ impl Host {
         // Charge for the push, which might also run out of gas.
         Vec::<Context>::charge_bulk_init_cpy(1, self.as_budget())?;
         // Finally commit to doing the push.
-        self.try_borrow_context_stack_mut()?.push(ctx);
+        {
+            let mut contexts = self.try_borrow_context_stack_mut()?;
+            let mut sac_caches = self.try_borrow_sac_metadata_cache_stack_mut()?;
+            contexts.push(ctx);
+            sac_caches.push(SacInstanceMetadataCache::default());
+        }
         Ok(rp)
     }
 
@@ -211,6 +241,7 @@ impl Host {
         let _span = tracy_span!("pop context");
 
         let ctx = self.try_borrow_context_stack_mut()?.pop();
+        let sac_cache = self.try_borrow_sac_metadata_cache_stack_mut()?.pop();
 
         #[cfg(any(test, feature = "recording_mode"))]
         if self.try_borrow_context_stack()?.is_empty() {
@@ -227,14 +258,23 @@ impl Host {
         }
         self.try_borrow_authorization_manager()?
             .pop_frame(self, auth_snapshot)?;
-        ctx.ok_or_else(|| {
+        let ctx = ctx.ok_or_else(|| {
             self.err(
                 ScErrorType::Context,
                 ScErrorCode::InternalError,
                 "unmatched host context push/pop",
                 &[],
             )
-        })
+        })?;
+        if sac_cache.is_none() {
+            return Err(self.err(
+                ScErrorType::Context,
+                ScErrorCode::InternalError,
+                "unmatched SAC metadata cache push/pop",
+                &[],
+            ));
+        }
+        Ok(ctx)
     }
 
     /// Applies a function to the top [`Frame`] of the context stack. Returns
@@ -300,6 +340,31 @@ impl Host {
         }
     }
 
+    pub(super) fn with_current_sac_metadata_cache_mut<F, U>(&self, f: F) -> Result<U, HostError>
+    where
+        F: FnOnce(&mut SacInstanceMetadataCache) -> Result<U, HostError>,
+    {
+        let Ok(mut cache_guard) = self.0.sac_metadata_cache_stack.try_borrow_mut() else {
+            return Err(self.err(
+                ScErrorType::Context,
+                ScErrorCode::InternalError,
+                "SAC metadata cache stack is already borrowed",
+                &[],
+            ));
+        };
+        if let Some(cache) = cache_guard.last_mut() {
+            f(cache)
+        } else {
+            drop(cache_guard);
+            Err(self.err(
+                ScErrorType::Context,
+                ScErrorCode::InternalError,
+                "no SAC metadata cache for current frame",
+                &[],
+            ))
+        }
+    }
+
     /// Same as [`Self::with_current_frame`] but passes `None` when there is no current
     /// frame, rather than failing with an error.
     pub(crate) fn with_current_frame_opt<F, U>(&self, f: F) -> Result<U, HostError>
@@ -320,6 +385,91 @@ impl Host {
             drop(context_guard);
             f(None)
         }
+    }
+
+    fn is_sac_instance_metadata_cache_enabled(&self) -> Result<bool, HostError> {
+        Ok(self.get_ledger_protocol_version()? > MIN_LEDGER_PROTOCOL_VERSION)
+    }
+
+    fn sac_instance_metadata_key(
+        &self,
+        field: SacInstanceMetadataField,
+    ) -> Result<ScVal, HostError> {
+        let key = match field {
+            SacInstanceMetadataField::AssetInfo => InstanceDataKey::AssetInfo.try_into_val(self)?,
+            SacInstanceMetadataField::MetadataName => {
+                SymbolSmall::try_from_str("METADATA")?.try_into_val(self)?
+            }
+        };
+        self.from_host_val_for_storage(key)
+    }
+
+    pub(crate) fn cached_sac_asset_info(&self) -> Result<Option<Val>, HostError> {
+        self.cached_sac_instance_metadata_value(SacInstanceMetadataField::AssetInfo)
+    }
+
+    pub(crate) fn cached_sac_metadata_name(&self) -> Result<Option<Val>, HostError> {
+        self.cached_sac_instance_metadata_value(SacInstanceMetadataField::MetadataName)
+    }
+
+    fn cached_sac_instance_metadata_value(
+        &self,
+        field: SacInstanceMetadataField,
+    ) -> Result<Option<Val>, HostError> {
+        if !self.is_sac_instance_metadata_cache_enabled()? {
+            return Ok(None);
+        }
+        let cached = self.with_current_sac_metadata_cache_mut(|cache| {
+            if cache.invalidated {
+                return Ok(None);
+            }
+            Ok(match field {
+                SacInstanceMetadataField::AssetInfo => cache.asset_info,
+                SacInstanceMetadataField::MetadataName => cache.metadata_name,
+            })
+        })?;
+        if cached.is_some() {
+            return Ok(cached);
+        }
+
+        let key = self.sac_instance_metadata_key(field)?;
+        let cached_val = self.with_current_frame(|frame| {
+            let Frame::StellarAssetContract(_, _, _, instance) = frame else {
+                return Ok(None);
+            };
+
+            let Some(storage) = &instance.storage else {
+                return Ok(None);
+            };
+            let Some(entry) = storage.iter().find(|entry| entry.key == key) else {
+                return Ok(None);
+            };
+
+            let val = self.to_valid_host_val(&entry.val)?;
+            let cached_val = match field {
+                SacInstanceMetadataField::AssetInfo => val,
+                SacInstanceMetadataField::MetadataName => {
+                    let metadata: StellarAssetContractMetadata = val.try_into_val(self)?;
+                    metadata.name.try_into_val(self)?
+                }
+            };
+            Ok(Some(cached_val))
+        })?;
+
+        if let Some(cached_val) = cached_val {
+            self.with_current_sac_metadata_cache_mut(|cache| {
+                if !cache.invalidated {
+                    match field {
+                        SacInstanceMetadataField::AssetInfo => cache.asset_info = Some(cached_val),
+                        SacInstanceMetadataField::MetadataName => {
+                            cache.metadata_name = Some(cached_val)
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        Ok(cached_val)
     }
 
     pub(crate) fn with_current_frame_relative_object_table<F, U>(
