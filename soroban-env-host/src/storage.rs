@@ -464,6 +464,7 @@ impl Storage {
         host: &Host,
         key_val: Option<Val>,
     ) -> Result<(), HostError> {
+        host.clear_contract_data_has_cache()?;
         self.put_opt_helper(key, val, host)
             .map_err(|e| host.decorate_storage_error(e, key.as_ref(), key_val))
     }
@@ -652,6 +653,7 @@ impl Storage {
         key_val: Option<Val>,
     ) -> Result<(), HostError> {
         let _span = tracy_span!("extend key");
+        host.clear_contract_data_has_cache()?;
 
         if threshold > extend_to {
             return Err(host.err(
@@ -715,6 +717,7 @@ impl Storage {
         key_val: Option<Val>,
     ) -> Result<(), HostError> {
         let _span = tracy_span!("extend key v2");
+        host.clear_contract_data_has_cache()?;
 
         if max_extension < min_extension {
             return Err(host.err(
@@ -909,7 +912,7 @@ fn get_key_type_string_for_error(lk: &LedgerKey) -> &str {
 }
 
 impl Host {
-    fn decorate_storage_error(
+    pub(crate) fn decorate_storage_error(
         &self,
         err: HostError,
         lk: &LedgerKey,

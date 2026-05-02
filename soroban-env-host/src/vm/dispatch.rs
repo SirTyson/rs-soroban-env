@@ -240,6 +240,9 @@ macro_rules! generate_dispatch_functions {
                     // host budget, marshalling values. This does not account for the actual work
                     // being done in those functions, which are metered individually by the implementation.
                     host.charge_budget(ContractCostType::DispatchHostFunction, None)?;
+                    if core::stringify!($fn_id) != "get_contract_data" {
+                        host.clear_contract_data_has_cache()?;
+                    }
                     let mut vmcaller = VmCaller(Some(caller));
                     // The odd / seemingly-redundant use of `wasmi::Value` here
                     // as intermediates -- rather than just passing Vals --

@@ -413,6 +413,7 @@ impl Host {
             )
             .into());
         }
+        self.clear_contract_data_has_cache()?;
         #[cfg(any(test, feature = "testutils"))]
         {
             if let Some(ctx) = self.try_borrow_context_stack()?.last() {
@@ -560,6 +561,7 @@ impl Host {
             // Just pop on success.
             self.pop_context(None)?
         };
+        self.clear_contract_data_has_cache()?;
         // Every push and pop should be matched; if not there is a bug.
         let end_depth = self.try_borrow_context_stack()?.len();
         if start_depth != end_depth {

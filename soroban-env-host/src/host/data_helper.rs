@@ -53,6 +53,7 @@ impl Host {
     where
         F: FnOnce(&mut InstanceStorageMap) -> Result<U, HostError>,
     {
+        self.clear_contract_data_has_cache()?;
         self.with_current_context_mut(|ctx| {
             self.maybe_init_instance_storage(ctx)?;
             let storage = ctx.storage.as_mut().ok_or_else(|| {

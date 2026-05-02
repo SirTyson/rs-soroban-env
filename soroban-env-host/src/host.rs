@@ -10,12 +10,12 @@ use crate::{
     impl_bignum_host_fns, impl_bls12_381_fr_arith_host_fns, impl_bn254_fr_arith_host_fns,
     impl_wrapping_obj_from_num, impl_wrapping_obj_to_num,
     num::*,
-    storage::Storage,
+    storage::{EntryWithLiveUntil, Storage},
     vm::ModuleCache,
     xdr::{
         int128_helpers, AccountId, Asset, ContractCostType, ContractEventType, ContractExecutable,
         ContractIdPreimage, ContractIdPreimageFromAddress, CreateContractArgsV2, Duration,
-        LedgerEntryData, PublicKey, ScAddress, ScBytes, ScErrorCode, ScErrorType, ScString,
+        LedgerEntryData, LedgerKey, PublicKey, ScAddress, ScBytes, ScErrorCode, ScErrorType, ScString,
         ScSymbol, ScVal, TimePoint, VecM,
     },
     AddressObject, Bool, BytesObject, Compare, ContractTtlExtension, ConversionError, EnvBase,
@@ -88,6 +88,20 @@ pub struct CoverageScoreboard {
 // The soroban 26.x host only supports protocol 26 and later.
 pub(crate) const MIN_LEDGER_PROTOCOL_VERSION: u32 = 26;
 
+#[derive(Clone)]
+enum LastContractDataHas {
+    Durable {
+        key_val: Val,
+        storage_type: StorageType,
+        ledger_key: Rc<LedgerKey>,
+        entry: Option<EntryWithLiveUntil>,
+    },
+    Instance {
+        key_val: Val,
+        entry: Option<Val>,
+    },
+}
+
 #[derive(Clone, Default)]
 struct HostImpl {
     module_cache: RefCell<Option<ModuleCache>>,
@@ -96,6 +110,7 @@ struct HostImpl {
     objects: RefCell<Vec<HostObject>>,
     storage: RefCell<Storage>,
     context_stack: RefCell<Vec<Context>>,
+    contract_data_has_cache: RefCell<Option<LastContractDataHas>>,
     // Note: budget is refcounted and is _not_ deep-cloned when you call HostImpl::deep_clone,
     // mainly because it's not really possible to achieve (the same budget is connected to many
     // metered sub-objects) but also because it's plausible that the person calling deep_clone
@@ -238,6 +253,41 @@ impl_checked_borrow_helpers!(
     try_borrow_context_stack,
     try_borrow_context_stack_mut
 );
+
+impl Host {
+    pub(crate) fn clear_contract_data_has_cache(&self) -> Result<(), HostError> {
+        self.0
+            .contract_data_has_cache
+            .try_borrow_mut_or_err_with(
+                self,
+                "host.0.contract_data_has_cache.try_borrow_mut failed",
+            )?
+            .take();
+        Ok(())
+    }
+
+    fn set_contract_data_has_cache(&self, cache: LastContractDataHas) -> Result<(), HostError> {
+        *self
+            .0
+            .contract_data_has_cache
+            .try_borrow_mut_or_err_with(
+                self,
+                "host.0.contract_data_has_cache.try_borrow_mut failed",
+            )? = Some(cache);
+        Ok(())
+    }
+
+    fn take_contract_data_has_cache(&self) -> Result<Option<LastContractDataHas>, HostError> {
+        Ok(self
+            .0
+            .contract_data_has_cache
+            .try_borrow_mut_or_err_with(
+                self,
+                "host.0.contract_data_has_cache.try_borrow_mut failed",
+            )?
+            .take())
+    }
+}
 impl_checked_borrow_helpers!(
     events,
     InternalEventsBuffer,
@@ -362,6 +412,7 @@ impl Host {
             objects: Default::default(),
             storage: RefCell::new(storage),
             context_stack: Default::default(),
+            contract_data_has_cache: Default::default(),
             budget,
             events: Default::default(),
             authorization_manager: RefCell::new(
@@ -2194,6 +2245,7 @@ impl VmCallerEnv for Host {
         v: Val,
         t: StorageType,
     ) -> Result<Void, HostError> {
+        self.clear_contract_data_has_cache()?;
         match t {
             StorageType::Temporary | StorageType::Persistent => {
                 self.put_contract_data_into_ledger(k, v, t)?
@@ -2214,13 +2266,31 @@ impl VmCallerEnv for Host {
         k: Val,
         t: StorageType,
     ) -> Result<Bool, HostError> {
+        self.clear_contract_data_has_cache()?;
         let res = match t {
             StorageType::Temporary | StorageType::Persistent => {
                 let key = self.storage_key_from_val(k, t.try_into()?)?;
-                self.try_borrow_storage_mut()?.has(&key, self, Some(k))?
+                let entry = {
+                    let mut storage = self.try_borrow_storage_mut()?;
+                    storage.try_get_full(&key, self, Some(k))?
+                };
+                let res = entry.is_some();
+                self.set_contract_data_has_cache(LastContractDataHas::Durable {
+                    key_val: k,
+                    storage_type: t,
+                    ledger_key: key,
+                    entry,
+                })?;
+                res
             }
             StorageType::Instance => {
-                self.with_instance_storage(|s| Ok(s.map.get(&k, self)?.is_some()))?
+                let entry = self.with_instance_storage(|s| Ok(s.map.get(&k, self)?.copied()))?;
+                let res = entry.is_some();
+                self.set_contract_data_has_cache(LastContractDataHas::Instance {
+                    key_val: k,
+                    entry,
+                })?;
+                res
             }
         };
 
@@ -2234,6 +2304,50 @@ impl VmCallerEnv for Host {
         k: Val,
         t: StorageType,
     ) -> Result<Val, HostError> {
+        let cached = self.take_contract_data_has_cache()?;
+        match cached {
+            Some(LastContractDataHas::Durable {
+                key_val,
+                storage_type,
+                ledger_key,
+                entry,
+            }) if key_val.get_payload() == k.get_payload() && storage_type == t => match entry {
+                Some((entry, _)) => match &entry.data {
+                    LedgerEntryData::ContractData(e) => return Ok(self.to_valid_host_val(&e.val)?),
+                    _ => {
+                        return Err(self.err(
+                            ScErrorType::Storage,
+                            ScErrorCode::InternalError,
+                            "expected contract data ledger entry",
+                            &[],
+                        ))
+                    }
+                },
+                None => {
+                    let err: HostError = (ScErrorType::Storage, ScErrorCode::MissingValue).into();
+                    return Err(self.decorate_storage_error(err, ledger_key.as_ref(), Some(k)));
+                }
+            },
+            Some(LastContractDataHas::Instance {
+                key_val,
+                entry: Some(v),
+            }) if key_val.get_payload() == k.get_payload() && matches!(t, StorageType::Instance) => {
+                return Ok(v)
+            }
+            Some(LastContractDataHas::Instance {
+                key_val,
+                entry: None,
+            }) if key_val.get_payload() == k.get_payload() && matches!(t, StorageType::Instance) => {
+                return Err(self.err(
+                    ScErrorType::Storage,
+                    ScErrorCode::MissingValue,
+                    "key is missing from instance storage",
+                    &[k],
+                ))
+            }
+            _ => {}
+        }
+
         match t {
             StorageType::Temporary | StorageType::Persistent => {
                 let key = self.storage_key_from_val(k, t.try_into()?)?;
@@ -2271,6 +2385,7 @@ impl VmCallerEnv for Host {
         k: Val,
         t: StorageType,
     ) -> Result<Void, HostError> {
+        self.clear_contract_data_has_cache()?;
         match t {
             StorageType::Temporary | StorageType::Persistent => {
                 let key = self.storage_key_from_val(k, t.try_into()?)?;
@@ -2298,6 +2413,7 @@ impl VmCallerEnv for Host {
         threshold: U32Val,
         extend_to: U32Val,
     ) -> Result<Void, HostError> {
+        self.clear_contract_data_has_cache()?;
         if matches!(t, StorageType::Instance) {
             return Err(self.err(
                 ScErrorType::Storage,
@@ -2396,6 +2512,7 @@ impl VmCallerEnv for Host {
         min_extension: U32Val,
         max_extension: U32Val,
     ) -> Result<Void, HostError> {
+        self.clear_contract_data_has_cache()?;
         if matches!(t, StorageType::Instance) {
             return Err(self.err(
                 ScErrorType::Storage,
