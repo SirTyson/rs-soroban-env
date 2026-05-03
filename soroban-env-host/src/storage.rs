@@ -545,6 +545,17 @@ impl Storage {
         // Extending deleted/non-existing/out-of-footprint entries will result in
         // an error.
         let (entry, old_live_until) = self.get_with_live_until_ledger(key, host, key_val)?;
+        self.prepare_extend_ttl_from_entry(host, key, entry, old_live_until, extend_to)
+    }
+
+    fn prepare_extend_ttl_from_entry(
+        &mut self,
+        host: &Host,
+        key: &Rc<LedgerKey>,
+        entry: Rc<LedgerEntry>,
+        old_live_until: Option<u32>,
+        extend_to: u32,
+    ) -> Result<TtlExtensionInfo, HostError> {
         let old_live_until = old_live_until.ok_or_else(|| {
             host.err(
                 ScErrorType::Storage,
@@ -595,6 +606,50 @@ impl Storage {
             current_ttl,
             max_live_until,
         })
+    }
+
+    pub(crate) fn extend_ttl_from_entry(
+        &mut self,
+        host: &Host,
+        key: Rc<LedgerKey>,
+        entry_with_live_until: EntryWithLiveUntil,
+        threshold: u32,
+        extend_to: u32,
+        key_val: Option<Val>,
+    ) -> Result<(), HostError> {
+        let _span = tracy_span!("extend key");
+
+        if threshold > extend_to {
+            return Err(host.err(
+                ScErrorType::Storage,
+                ScErrorCode::InvalidInput,
+                "threshold must be <= extend_to",
+                &[threshold.into(), extend_to.into()],
+            ));
+        }
+
+        Self::check_supported_ledger_key_type(&key)?;
+        self.prepare_read_only_access(&key, host)
+            .map_err(|e| host.decorate_storage_error(e, key.as_ref(), key_val))?;
+        let (entry, old_live_until) = entry_with_live_until;
+        let ttl_ext_info =
+            self.prepare_extend_ttl_from_entry(host, &key, entry, old_live_until, extend_to)?;
+
+        let mut new_live_until = host.with_ledger_info(|li| {
+            li.sequence_number.checked_add(extend_to).ok_or_else(|| {
+                HostError::from(Error::from_type_and_code(
+                    ScErrorType::Context,
+                    ScErrorCode::InternalError,
+                ))
+            })
+        })?;
+
+        new_live_until = new_live_until.min(ttl_ext_info.max_live_until);
+
+        if ttl_ext_info.current_ttl <= threshold {
+            self.apply_ttl_extension(host, key, ttl_ext_info, new_live_until)?;
+        }
+        Ok(())
     }
 
     /// Updates the storage map with a new live_until value if it extends the TTL.
