@@ -52,9 +52,10 @@ rev = "0ed3f3dee30dc41ebe21972399e0a73a41944aa0"
 # [patch."https://github.com/stellar/rs-stellar-xdr"]
 # [patch.crates-io]
 # stellar-xdr = { path = "../rs-stellar-xdr" }
-# [patch."https://github.com/stellar/wasmi"]
-# soroban-wasmi = { path = "../wasmi/crates/wasmi/" }
-# soroban-wasmi_core = { path = "../wasmi/crates/core/" }
+[patch."https://github.com/stellar/wasmi"]
+soroban-wasmi = { git = "https://github.com/SirTyson/wasmi", rev = "bf3b7563bf922a51056a6e97db69771f5c5f9c46" }
+wasmi_arena = { git = "https://github.com/SirTyson/wasmi", rev = "bf3b7563bf922a51056a6e97db69771f5c5f9c46" }
+wasmi_core = { git = "https://github.com/SirTyson/wasmi", rev = "bf3b7563bf922a51056a6e97db69771f5c5f9c46" }
 
 [profile.release]
 lto = true
