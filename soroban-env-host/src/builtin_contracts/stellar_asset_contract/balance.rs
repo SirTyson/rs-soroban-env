@@ -237,7 +237,7 @@ impl ContractBalanceSlot {
 
     fn write(&mut self, e: &Host, balance: BalanceValue) -> Result<(), HostError> {
         let val = balance_value_scval(e, &balance)?;
-        let entry = if let Some((current, live_until_ledger)) = self.entry.take() {
+        let mut entry = if let Some((current, live_until_ledger)) = self.entry.take() {
             let mut current = (*current).metered_clone(e)?;
             match current.data {
                 LedgerEntryData::ContractData(ref mut entry) => {
@@ -266,6 +266,7 @@ impl ContractBalanceSlot {
                 Some(e.get_min_live_until_ledger(ContractDataDurability::Persistent)?),
             )
         };
+        entry.1 = Some(extended_contract_balance_live_until(e, entry.1)?);
 
         e.try_borrow_storage_mut()?.put(
             &self.key,
@@ -276,14 +277,65 @@ impl ContractBalanceSlot {
         )?;
         self.entry = Some((Rc::clone(&entry.0), entry.1));
         self.balance = Some(balance);
-        e.try_borrow_storage_mut()?.extend_ttl_from_entry(
-            e,
-            Rc::clone(&self.key),
-            entry,
-            BALANCE_TTL_THRESHOLD,
-            BALANCE_EXTEND_AMOUNT,
-            None,
+        Ok(())
+    }
+}
+
+fn extended_contract_balance_live_until(
+    e: &Host,
+    old_live_until: Option<u32>,
+) -> Result<u32, HostError> {
+    if BALANCE_TTL_THRESHOLD > BALANCE_EXTEND_AMOUNT {
+        return Err(e.err(
+            ScErrorType::Storage,
+            ScErrorCode::InvalidInput,
+            "threshold must be <= extend_to",
+            &[BALANCE_TTL_THRESHOLD.into(), BALANCE_EXTEND_AMOUNT.into()],
+        ));
+    }
+    let old_live_until = old_live_until.ok_or_else(|| {
+        e.err(
+            ScErrorType::Storage,
+            ScErrorCode::InternalError,
+            "trying to extend invalid entry",
+            &[],
         )
+    })?;
+    let (ledger_seq, new_live_until) = e.with_ledger_info(|li| {
+        let target_live_until = li
+            .sequence_number
+            .checked_add(BALANCE_EXTEND_AMOUNT)
+            .ok_or_else(|| {
+                e.err(
+                    ScErrorType::Context,
+                    ScErrorCode::InternalError,
+                    "balance TTL overflow, ledger is mis-configured",
+                    &[],
+                )
+            })?;
+        let max_live_until = li.max_live_until_ledger_checked().ok_or_else(|| {
+            e.err(
+                ScErrorType::Context,
+                ScErrorCode::InternalError,
+                "balance max TTL overflow, ledger is mis-configured",
+                &[],
+            )
+        })?;
+        Ok((li.sequence_number, target_live_until.min(max_live_until)))
+    })?;
+    if old_live_until < ledger_seq {
+        return Err(e.err(
+            ScErrorType::Storage,
+            ScErrorCode::InternalError,
+            "accessing no-longer-live entry",
+            &[old_live_until.into(), ledger_seq.into()],
+        ));
+    }
+    let current_ttl = old_live_until.saturating_sub(ledger_seq);
+    if current_ttl <= BALANCE_TTL_THRESHOLD && new_live_until > old_live_until {
+        Ok(new_live_until)
+    } else {
+        Ok(old_live_until)
     }
 }
 
