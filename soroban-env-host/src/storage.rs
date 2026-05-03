@@ -26,6 +26,12 @@ use crate::{
 pub type FootprintMap = MeteredOrdMap<Rc<LedgerKey>, AccessType, Budget>;
 pub type EntryWithLiveUntil = (Rc<LedgerEntry>, Option<u32>);
 pub type StorageMap = MeteredOrdMap<Rc<LedgerKey>, Option<EntryWithLiveUntil>, Budget>;
+type StorageJournal = Vec<(usize, Option<EntryWithLiveUntil>)>;
+
+pub(crate) enum StorageRollbackPoint {
+    Snapshot(StorageMap),
+    Journal,
+}
 
 /// The in-memory instance storage of the current running contract. Initially
 /// contains entries from the `ScMap` of the corresponding `ScContractInstance`
@@ -192,6 +198,7 @@ pub struct Storage {
     /// values change in enforcing mode, so positions remain valid across
     /// in-place replaces.
     pub(crate) enforce_storage_idx: Option<Rc<HashMap<LedgerKey, usize>>>,
+    rollback_journal: Option<Vec<StorageJournal>>,
 }
 
 /// Helper struct holding common state for TTL extension operations.
@@ -264,6 +271,7 @@ impl Storage {
             map,
             enforce_footprint_idx: Some(Rc::new(fp_idx)),
             enforce_storage_idx: Some(Rc::new(st_idx)),
+            rollback_journal: Some(Vec::new()),
         }
     }
 
@@ -277,7 +285,114 @@ impl Storage {
             map: Default::default(),
             enforce_footprint_idx: None,
             enforce_storage_idx: None,
+            rollback_journal: None,
         }
+    }
+
+    fn can_use_rollback_journal(&self) -> bool {
+        matches!(self.mode, FootprintMode::Enforcing)
+            && self.rollback_journal.is_some()
+            && self
+                .enforce_storage_idx
+                .as_ref()
+                .is_some_and(|idx| idx.len() == self.map.map.len())
+    }
+
+    pub(crate) fn push_rollback_frame(
+        &mut self,
+        host: &Host,
+    ) -> Result<StorageRollbackPoint, HostError> {
+        if self.can_use_rollback_journal() {
+            self.map.charge_metered_clone(host.budget_ref())?;
+            let Some(journal) = &mut self.rollback_journal else {
+                return Err((ScErrorType::Storage, ScErrorCode::InternalError).into());
+            };
+            journal.push(Vec::new());
+            Ok(StorageRollbackPoint::Journal)
+        } else {
+            Ok(StorageRollbackPoint::Snapshot(
+                self.map.metered_clone(host.budget_ref())?,
+            ))
+        }
+    }
+
+    pub(crate) fn commit_rollback_frame(
+        &mut self,
+        rp: StorageRollbackPoint,
+    ) -> Result<(), HostError> {
+        match rp {
+            StorageRollbackPoint::Snapshot(_) => Ok(()),
+            StorageRollbackPoint::Journal => {
+                let Some(journal) = &mut self.rollback_journal else {
+                    return Err((ScErrorType::Storage, ScErrorCode::InternalError).into());
+                };
+                let Some(frame) = journal.pop() else {
+                    return Err((ScErrorType::Storage, ScErrorCode::InternalError).into());
+                };
+                if let Some(parent) = journal.last_mut() {
+                    for (pos, old) in frame {
+                        if !parent.iter().any(|(p, _)| *p == pos) {
+                            parent.push((pos, old));
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn rollback_rollback_frame(
+        &mut self,
+        rp: StorageRollbackPoint,
+    ) -> Result<(), HostError> {
+        match rp {
+            StorageRollbackPoint::Snapshot(map) => {
+                self.map = map;
+                Ok(())
+            }
+            StorageRollbackPoint::Journal => {
+                let Some(journal) = &mut self.rollback_journal else {
+                    return Err((ScErrorType::Storage, ScErrorCode::InternalError).into());
+                };
+                let Some(frame) = journal.pop() else {
+                    return Err((ScErrorType::Storage, ScErrorCode::InternalError).into());
+                };
+                for (pos, old) in frame.into_iter().rev() {
+                    let Some((_, val)) = self.map.map.get_mut(pos) else {
+                        return Err((ScErrorType::Storage, ScErrorCode::InternalError).into());
+                    };
+                    *val = old;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn replace_value_at_known_position(
+        &mut self,
+        pos: usize,
+        val: Option<EntryWithLiveUntil>,
+        host: &Host,
+    ) -> Result<(), HostError> {
+        let should_journal = self
+            .rollback_journal
+            .as_ref()
+            .and_then(|journal| journal.last())
+            .map_or(false, |frame| !frame.iter().any(|(p, _)| *p == pos));
+        let old = self
+            .map
+            .replace_value_at_known_position(pos, val, host.budget_ref())?;
+        if should_journal {
+            let Some(frame) = self
+                .rollback_journal
+                .as_mut()
+                .and_then(|journal| journal.last_mut())
+            else {
+                return Err((ScErrorType::Storage, ScErrorCode::InternalError).into());
+            };
+            frame.push((pos, old));
+        }
+        Ok(())
     }
 
     // PoC H002: enforcing-mode footprint access check using the precomputed
@@ -443,12 +558,7 @@ impl Storage {
         if let Some(idx) = self.enforce_storage_idx.clone() {
             if idx.len() == self.map.map.len() {
                 if let Some(&pos) = idx.get(key.as_ref()) {
-                    self.map = self.map.insert_at_known_position(
-                        pos,
-                        Rc::clone(key),
-                        val,
-                        host.budget_ref(),
-                    )?;
+                    self.replace_value_at_known_position(pos, val, host)?;
                     return Ok(());
                 }
             }
@@ -610,11 +720,10 @@ impl Storage {
             if let Some(idx) = self.enforce_storage_idx.clone() {
                 if idx.len() == self.map.map.len() {
                     if let Some(&pos) = idx.get(key.as_ref()) {
-                        self.map = self.map.insert_at_known_position(
+                        self.replace_value_at_known_position(
                             pos,
-                            key,
                             Some((ttl_ext_info.entry, Some(new_live_until))),
-                            host.budget_ref(),
+                            host,
                         )?;
                         return Ok(());
                     }

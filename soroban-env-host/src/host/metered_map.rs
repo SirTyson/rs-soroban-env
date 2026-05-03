@@ -1,11 +1,15 @@
 use crate::{
     budget::{AsBudget, Budget},
-    host::{declared_size::DeclaredSizeForMetering, MeteredClone},
+    host::{
+        declared_size::DeclaredSizeForMetering,
+        metered_clone::{charge_heap_alloc, charge_shallow_copy},
+        MeteredClone,
+    },
     xdr::{ContractCostType, ScErrorCode, ScErrorType},
     Compare, Error, Host, HostError,
 };
 
-use std::{borrow::Borrow, cmp::Ordering, marker::PhantomData};
+use std::{borrow::Borrow, cmp::Ordering, marker::PhantomData, mem};
 
 use super::metered_vector::binary_search_by_pre_rust_182;
 
@@ -382,6 +386,49 @@ where
         // by construction (replace at known position).
         m.charge_scan(ctx)?;
         Ok(m)
+    }
+
+    pub(crate) fn charge_metered_clone<B: AsBudget>(&self, b: &B) -> Result<(), HostError> {
+        charge_shallow_copy::<Self>(1, b.as_budget())?;
+        self.charge_for_substructure(b.as_budget())
+    }
+
+    pub(crate) fn replace_value_at_known_position(
+        &mut self,
+        pos: usize,
+        value: V,
+        ctx: &Ctx,
+    ) -> Result<V, HostError> {
+        if pos >= self.map.len() {
+            return Err((ScErrorType::Object, ScErrorCode::InternalError).into());
+        }
+        self.charge_access(1, ctx)?;
+        self.charge_binsearch(ctx)?;
+
+        // Match the vector deep-clone charge that `insert_at_known_position`
+        // would pay after constructing the replacement vector, but without
+        // actually allocating and copying that vector.
+        charge_shallow_copy::<Vec<(K, V)>>(1, ctx.as_budget())?;
+        charge_heap_alloc::<(K, V)>(self.map.len() as u64, ctx.as_budget())?;
+        charge_shallow_copy::<(K, V)>(self.map.len() as u64, ctx.as_budget())?;
+        for (i, (k, v)) in self.map.iter().enumerate() {
+            if !K::IS_SHALLOW {
+                k.charge_for_substructure(ctx.as_budget())?;
+            }
+            if !V::IS_SHALLOW {
+                if i == pos {
+                    value.charge_for_substructure(ctx.as_budget())?;
+                } else {
+                    v.charge_for_substructure(ctx.as_budget())?;
+                }
+            }
+        }
+        self.charge_scan(ctx)?;
+
+        let Some((_, old)) = self.map.get_mut(pos) else {
+            return Err((ScErrorType::Object, ScErrorCode::InternalError).into());
+        };
+        Ok(mem::replace(old, value))
     }
 }
 
