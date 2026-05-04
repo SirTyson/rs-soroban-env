@@ -157,7 +157,7 @@ impl Host {
         let res = self.create_contract_with_optional_auth(deployer, args, constructor_args);
         if has_deployer {
             self.try_borrow_authorization_manager()?
-                .pop_frame(self, None)?;
+                .pop_create_contract_host_fn_frame(self)?;
         }
         res
     }

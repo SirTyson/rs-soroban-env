@@ -1014,8 +1014,8 @@ fn test_two_authorized_trees() {
                         ),
                     ),
                     resources: SubInvocationResources {
-                        instructions: 1573332,
-                        mem_bytes: 3636258,
+                        instructions: 1577586,
+                        mem_bytes: 3636674,
                         disk_read_entries: 1,
                         memory_read_entries: 4,
                         write_entries: 1,

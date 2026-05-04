@@ -207,7 +207,11 @@ impl Host {
     /// Helper function for [`Host::with_frame`] below. Pops a [`Context`] off
     /// the current context stack and optionally rolls back the [`Host`]'s objects
     /// and storage map to the state in the provided [`RollbackPoint`].
-    pub(super) fn pop_context(&self, orp: Option<RollbackPoint>) -> Result<Context, HostError> {
+    pub(super) fn pop_context(
+        &self,
+        rp: RollbackPoint,
+        rollback: bool,
+    ) -> Result<Context, HostError> {
         let _span = tracy_span!("pop context");
 
         let ctx = self.try_borrow_context_stack_mut()?.pop();
@@ -219,14 +223,12 @@ impl Host {
             self.try_borrow_authorization_manager()?
                 .maybe_emulate_authentication(self)?;
         }
-        let mut auth_snapshot = None;
-        if let Some(rp) = orp {
+        if rollback {
             self.try_borrow_storage_mut()?.map = rp.storage;
             self.try_borrow_events_mut()?.rollback(rp.events)?;
-            auth_snapshot = Some(rp.auth);
         }
         self.try_borrow_authorization_manager()?
-            .pop_frame(self, auth_snapshot)?;
+            .pop_frame(self, Some(rp.auth), rollback)?;
         ctx.ok_or_else(|| {
             self.err(
                 ScErrorType::Context,
@@ -555,10 +557,10 @@ impl Host {
         }
         if res.is_err() {
             // Pop and rollback on error.
-            self.pop_context(Some(rp))?
+            self.pop_context(rp, true)?
         } else {
             // Just pop on success.
-            self.pop_context(None)?
+            self.pop_context(rp, false)?
         };
         // Every push and pop should be matched; if not there is a bug.
         let end_depth = self.try_borrow_context_stack()?.len();
