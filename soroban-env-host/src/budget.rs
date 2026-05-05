@@ -32,6 +32,58 @@ pub struct CostTracker {
     pub mem: u64,
 }
 
+fn cost_type_expects_input(ty: ContractCostType) -> bool {
+    matches!(
+        ty,
+        ContractCostType::MemAlloc
+            | ContractCostType::MemCpy
+            | ContractCostType::MemCmp
+            | ContractCostType::ValSer
+            | ContractCostType::ValDeser
+            | ContractCostType::ComputeSha256Hash
+            | ContractCostType::VerifyEd25519Sig
+            | ContractCostType::VmInstantiation
+            | ContractCostType::VmCachedInstantiation
+            | ContractCostType::ComputeKeccak256Hash
+            | ContractCostType::ChaCha20DrawBytes
+            | ContractCostType::ParseWasmInstructions
+            | ContractCostType::ParseWasmFunctions
+            | ContractCostType::ParseWasmGlobals
+            | ContractCostType::ParseWasmTableEntries
+            | ContractCostType::ParseWasmTypes
+            | ContractCostType::ParseWasmDataSegments
+            | ContractCostType::ParseWasmElemSegments
+            | ContractCostType::ParseWasmImports
+            | ContractCostType::ParseWasmExports
+            | ContractCostType::ParseWasmDataSegmentBytes
+            | ContractCostType::InstantiateWasmFunctions
+            | ContractCostType::InstantiateWasmGlobals
+            | ContractCostType::InstantiateWasmTableEntries
+            | ContractCostType::InstantiateWasmDataSegments
+            | ContractCostType::InstantiateWasmElemSegments
+            | ContractCostType::InstantiateWasmImports
+            | ContractCostType::InstantiateWasmExports
+            | ContractCostType::InstantiateWasmDataSegmentBytes
+            | ContractCostType::Bls12381G1Msm
+            | ContractCostType::Bls12381HashToG1
+            | ContractCostType::Bls12381G2Msm
+            | ContractCostType::Bls12381HashToG2
+            | ContractCostType::Bls12381Pairing
+            | ContractCostType::Bls12381FrPow
+            | ContractCostType::Bn254G1Msm
+            | ContractCostType::Bn254Pairing
+            | ContractCostType::Bn254FrPow
+    )
+}
+
+fn validate_charge_input(ty: ContractCostType, input: Option<u64>) -> Result<(), HostError> {
+    if cost_type_expects_input(ty) == input.is_some() {
+        Ok(())
+    } else {
+        Err((ScErrorType::Budget, ScErrorCode::InternalError).into())
+    }
+}
+
 #[derive(Clone)]
 struct BudgetTracker {
     // Tracker for each `CostType`
@@ -201,9 +253,9 @@ pub(crate) struct BudgetImpl {
     mem_bytes: BudgetDimension,
     /// For the purpose of calibration and reporting; not used for budget-limiting nor does it affect consensus
     tracker: BudgetTracker,
-    full_cost_tracking: bool,
     is_in_shadow_mode: bool,
     coalesced_host_metering: bool,
+    full_cost_tracking: bool,
     fuel_costs: wasmi::FuelCosts,
     depth_limit: u32,
 }
@@ -220,16 +272,12 @@ impl BudgetImpl {
             cpu_insns: BudgetDimension::try_from_config(cpu_cost_params, cpu_limit)?,
             mem_bytes: BudgetDimension::try_from_config(mem_cost_params, mem_limit)?,
             tracker: BudgetTracker::default(),
-            full_cost_tracking: true,
             is_in_shadow_mode: false,
             coalesced_host_metering: false,
+            full_cost_tracking: true,
             fuel_costs: load_calibrated_fuel_costs(),
             depth_limit: DEFAULT_HOST_DEPTH_LIMIT,
         })
-    }
-
-    fn validates_input_shape(tracker: &CostTracker, input: Option<u64>) -> bool {
-        matches!((tracker.inputs, input), (None, None) | (Some(_), Some(_)))
     }
 
     pub(crate) fn get_memory_cost(
@@ -247,28 +295,27 @@ impl BudgetImpl {
         iterations: u64,
         input: Option<u64>,
     ) -> Result<(), HostError> {
-        let tracker = self
-            .tracker
-            .cost_trackers
-            .get_mut(ty as usize)
-            .ok_or_else(|| HostError::from((ScErrorType::Budget, ScErrorCode::InternalError)))?;
-        let track_cost = self.full_cost_tracking || ty == ContractCostType::VmInstantiation;
+        let track_this_cost = !self.is_in_shadow_mode
+            && (self.full_cost_tracking || ty == ContractCostType::VmInstantiation);
 
-        if !self.is_in_shadow_mode && track_cost {
+        if !self.is_in_shadow_mode {
+            validate_charge_input(ty, input)?;
+        }
+
+        if track_this_cost {
+            let tracker = self
+                .tracker
+                .cost_trackers
+                .get_mut(ty as usize)
+                .ok_or_else(|| {
+                    HostError::from((ScErrorType::Budget, ScErrorCode::InternalError))
+                })?;
             // update tracker for reporting
             self.tracker.meter_count = self.tracker.meter_count.saturating_add(1);
             tracker.iterations = tracker.iterations.saturating_add(iterations);
-            match (&mut tracker.inputs, input) {
-                (None, None) => (),
-                (Some(t), Some(i)) => *t = t.saturating_add(i.saturating_mul(iterations)),
-                // internal logic error, a wrong cost type has been passed in
-                _ => return Err((ScErrorType::Budget, ScErrorCode::InternalError).into()),
-            };
-        } else if !self.is_in_shadow_mode && !Self::validates_input_shape(tracker, input) {
-            // Preserve the existing internal-error behavior for callers that
-            // pass a linear input to a constant cost type, or vice versa, even
-            // when per-cost reporting is disabled.
-            return Err((ScErrorType::Budget, ScErrorCode::InternalError).into());
+            if let (Some(t), Some(i)) = (&mut tracker.inputs, input) {
+                *t = t.saturating_add(i.saturating_mul(iterations));
+            }
         }
 
         let cpu_charged = self.cpu_insns.charge(
@@ -278,7 +325,14 @@ impl BudgetImpl {
             IsCpu(true),
             IsShadowMode(self.is_in_shadow_mode),
         )?;
-        if !self.is_in_shadow_mode && track_cost {
+        if track_this_cost {
+            let tracker = self
+                .tracker
+                .cost_trackers
+                .get_mut(ty as usize)
+                .ok_or_else(|| {
+                    HostError::from((ScErrorType::Budget, ScErrorCode::InternalError))
+                })?;
             tracker.cpu = tracker.cpu.saturating_add(cpu_charged);
         }
         self.cpu_insns
@@ -291,7 +345,14 @@ impl BudgetImpl {
             IsCpu(false),
             IsShadowMode(self.is_in_shadow_mode),
         )?;
-        if !self.is_in_shadow_mode && track_cost {
+        if track_this_cost {
+            let tracker = self
+                .tracker
+                .cost_trackers
+                .get_mut(ty as usize)
+                .ok_or_else(|| {
+                    HostError::from((ScErrorType::Budget, ScErrorCode::InternalError))
+                })?;
             tracker.mem = tracker.mem.saturating_add(mem_charged);
         }
         self.mem_bytes
@@ -305,8 +366,9 @@ impl BudgetImpl {
     /// the per-leaf charge path. Tracker fields (`meter_count`, `iterations`,
     /// `inputs`, `cpu`, `mem`) and dimension `total_count`s are updated to
     /// match what would have been recorded by `count` separate single-leaf
-    /// charges of the same length, so cost-model totals and budget-limit
-    /// outcomes remain bit-identical to the unbatched path.
+    /// charges of the same length when full cost tracking is enabled, so
+    /// cost-model totals and budget-limit outcomes remain bit-identical to the
+    /// unbatched path.
     pub(crate) fn charge_val_ser_batched(
         &mut self,
         hist: &[(u64, u64)],
@@ -339,13 +401,18 @@ impl BudgetImpl {
             return Ok(());
         }
 
-        let tracker = self
-            .tracker
-            .cost_trackers
-            .get_mut(ty as usize)
-            .ok_or_else(|| HostError::from((ScErrorType::Budget, ScErrorCode::InternalError)))?;
+        if !self.is_in_shadow_mode {
+            validate_charge_input(ty, Some(0))?;
+        }
 
         if !self.is_in_shadow_mode && self.full_cost_tracking {
+            let tracker = self
+                .tracker
+                .cost_trackers
+                .get_mut(ty as usize)
+                .ok_or_else(|| {
+                    HostError::from((ScErrorType::Budget, ScErrorCode::InternalError))
+                })?;
             let count_u32 = u32::try_from(total_count).unwrap_or(u32::MAX);
             self.tracker.meter_count = self.tracker.meter_count.saturating_add(count_u32);
             tracker.iterations = tracker.iterations.saturating_add(total_count);
@@ -355,8 +422,6 @@ impl BudgetImpl {
             }
             tracker.cpu = tracker.cpu.saturating_add(total_cpu);
             tracker.mem = tracker.mem.saturating_add(total_mem);
-        } else if !self.is_in_shadow_mode && !Self::validates_input_shape(tracker, Some(0)) {
-            return Err((ScErrorType::Budget, ScErrorCode::InternalError).into());
         }
 
         self.cpu_insns.charge_amount(
@@ -406,9 +471,9 @@ impl Default for BudgetImpl {
             cpu_insns: BudgetDimension::default(),
             mem_bytes: BudgetDimension::default(),
             tracker: Default::default(),
-            full_cost_tracking: true,
             is_in_shadow_mode: false,
             coalesced_host_metering: false,
+            full_cost_tracking: true,
             fuel_costs: load_calibrated_fuel_costs(),
             depth_limit: DEFAULT_HOST_DEPTH_LIMIT,
         };
@@ -1443,9 +1508,9 @@ impl Budget {
     /// to calling [`Budget::charge`] with `ContractCostType::ValSer` and
     /// `Some(input_len)` exactly `count` times for each bucket, but folds the
     /// per-leaf model evaluation, tracker bookkeeping, and limit checks into a
-    /// single mutable borrow of the budget. Used by `metered_write_xdr` to
-    /// remove per-chunk metering overhead from the XDR encoder hot path while
-    /// preserving observable budget totals exactly.
+    /// single mutable borrow of the budget. When full cost tracking is disabled,
+    /// this still preserves observable budget totals exactly while skipping the
+    /// reporting-only tracker fields.
     pub(crate) fn charge_val_ser_batched(
         &self,
         hist: &[(u64, u64)],

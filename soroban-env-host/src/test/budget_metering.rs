@@ -235,53 +235,83 @@ fn metered_xdr_out_of_budget() -> Result<(), HostError> {
 }
 
 #[test]
-fn production_budget_tracking_mode() -> Result<(), HostError> {
-    let run_charges = |budget: &Budget| -> Result<(), HostError> {
-        budget.charge(ContractCostType::MemCpy, Some(11))?;
-        budget.bulk_charge(ContractCostType::WasmInsnExec, 7, None)?;
-        budget.charge(ContractCostType::VmInstantiation, Some(13))?;
-        budget.track_time(ContractCostType::VmInstantiation, 17)
-    };
-
+fn production_tracking_mode_skips_reporting_only_trackers() -> Result<(), HostError> {
     let full = Budget::default();
-    run_charges(&full)?;
+    let fast = Budget::default();
+    fast.set_full_cost_tracking(false)?;
 
-    let production = Budget::default();
-    production.set_full_cost_tracking(false)?;
-    run_charges(&production)?;
+    for budget in [&full, &fast] {
+        budget.charge(ContractCostType::MemCpy, Some(10))?;
+        budget.bulk_charge(ContractCostType::VisitObject, 3, None)?;
+        budget.charge_val_ser_batched(&[(4, 2), (7, 1)])?;
+        budget.charge(ContractCostType::VmInstantiation, Some(123))?;
+        budget.track_time(ContractCostType::VmInstantiation, 19)?;
+    }
 
     assert_eq!(
-        production.get_cpu_insns_consumed()?,
-        full.get_cpu_insns_consumed()?
+        full.get_cpu_insns_consumed()?,
+        fast.get_cpu_insns_consumed()?
     );
     assert_eq!(
-        production.get_mem_bytes_consumed()?,
-        full.get_mem_bytes_consumed()?
+        full.get_mem_bytes_consumed()?,
+        fast.get_mem_bytes_consumed()?
     );
     assert_eq!(
-        production.get_tracker(ContractCostType::VmInstantiation)?.cpu,
-        full.get_tracker(ContractCostType::VmInstantiation)?.cpu
+        full.get_tracker(ContractCostType::VmInstantiation)?,
+        fast.get_tracker(ContractCostType::VmInstantiation)?
     );
     assert_eq!(
-        production.get_time(ContractCostType::VmInstantiation)?,
-        full.get_time(ContractCostType::VmInstantiation)?
+        full.get_time(ContractCostType::VmInstantiation)?,
+        fast.get_time(ContractCostType::VmInstantiation)?
     );
+
+    assert_ne!(full.get_tracker(ContractCostType::MemCpy)?.cpu, 0);
+    assert_eq!(fast.get_tracker(ContractCostType::MemCpy)?.cpu, 0);
     assert_eq!(
-        production.get_tracker(ContractCostType::MemCpy)?.iterations,
+        fast.get_tracker(ContractCostType::MemCpy)?.inputs,
+        Some(0)
+    );
+    assert_ne!(full.get_tracker(ContractCostType::VisitObject)?.iterations, 0);
+    assert_eq!(
+        fast.get_tracker(ContractCostType::VisitObject)?.iterations,
         0
     );
-    assert_eq!(
-        production
-            .get_tracker(ContractCostType::WasmInsnExec)?
-            .iterations,
-        0
-    );
+    assert_ne!(full.get_tracker(ContractCostType::ValSer)?.iterations, 0);
+    assert_eq!(fast.get_tracker(ContractCostType::ValSer)?.iterations, 0);
 
-    let res = production.charge(ContractCostType::MemCpy, None);
+    let code = (ScErrorType::Budget, ScErrorCode::InternalError);
     assert!(HostError::result_matches_err(
-        res,
-        (ScErrorType::Budget, ScErrorCode::InternalError)
+        fast.charge(ContractCostType::VisitObject, Some(1)),
+        code
     ));
+
+    let over_budget_code = (ScErrorType::Budget, ScErrorCode::ExceededLimit);
+    let full_limited = Host::test_host_with_prng()
+        .test_budget(10, 10)
+        .enable_model(ContractCostType::VisitObject, 7, 0, 0, 0);
+    let fast_limited = Host::test_host_with_prng()
+        .test_budget(10, 10)
+        .enable_model(ContractCostType::VisitObject, 7, 0, 0, 0);
+    fast_limited.as_budget().set_full_cost_tracking(false)?;
+    full_limited
+        .as_budget()
+        .charge(ContractCostType::VisitObject, None)?;
+    fast_limited
+        .as_budget()
+        .charge(ContractCostType::VisitObject, None)?;
+    assert!(HostError::result_matches_err(
+        full_limited
+            .as_budget()
+            .charge(ContractCostType::VisitObject, None),
+        over_budget_code
+    ));
+    assert!(HostError::result_matches_err(
+        fast_limited
+            .as_budget()
+            .charge(ContractCostType::VisitObject, None),
+        over_budget_code
+    ));
+
     Ok(())
 }
 
