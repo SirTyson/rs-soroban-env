@@ -201,6 +201,7 @@ pub(crate) struct BudgetImpl {
     mem_bytes: BudgetDimension,
     /// For the purpose of calibration and reporting; not used for budget-limiting nor does it affect consensus
     tracker: BudgetTracker,
+    full_cost_tracking: bool,
     is_in_shadow_mode: bool,
     coalesced_host_metering: bool,
     fuel_costs: wasmi::FuelCosts,
@@ -219,11 +220,16 @@ impl BudgetImpl {
             cpu_insns: BudgetDimension::try_from_config(cpu_cost_params, cpu_limit)?,
             mem_bytes: BudgetDimension::try_from_config(mem_cost_params, mem_limit)?,
             tracker: BudgetTracker::default(),
+            full_cost_tracking: true,
             is_in_shadow_mode: false,
             coalesced_host_metering: false,
             fuel_costs: load_calibrated_fuel_costs(),
             depth_limit: DEFAULT_HOST_DEPTH_LIMIT,
         })
+    }
+
+    fn validates_input_shape(tracker: &CostTracker, input: Option<u64>) -> bool {
+        matches!((tracker.inputs, input), (None, None) | (Some(_), Some(_)))
     }
 
     pub(crate) fn get_memory_cost(
@@ -246,8 +252,9 @@ impl BudgetImpl {
             .cost_trackers
             .get_mut(ty as usize)
             .ok_or_else(|| HostError::from((ScErrorType::Budget, ScErrorCode::InternalError)))?;
+        let track_cost = self.full_cost_tracking || ty == ContractCostType::VmInstantiation;
 
-        if !self.is_in_shadow_mode {
+        if !self.is_in_shadow_mode && track_cost {
             // update tracker for reporting
             self.tracker.meter_count = self.tracker.meter_count.saturating_add(1);
             tracker.iterations = tracker.iterations.saturating_add(iterations);
@@ -257,6 +264,11 @@ impl BudgetImpl {
                 // internal logic error, a wrong cost type has been passed in
                 _ => return Err((ScErrorType::Budget, ScErrorCode::InternalError).into()),
             };
+        } else if !self.is_in_shadow_mode && !Self::validates_input_shape(tracker, input) {
+            // Preserve the existing internal-error behavior for callers that
+            // pass a linear input to a constant cost type, or vice versa, even
+            // when per-cost reporting is disabled.
+            return Err((ScErrorType::Budget, ScErrorCode::InternalError).into());
         }
 
         let cpu_charged = self.cpu_insns.charge(
@@ -266,7 +278,7 @@ impl BudgetImpl {
             IsCpu(true),
             IsShadowMode(self.is_in_shadow_mode),
         )?;
-        if !self.is_in_shadow_mode {
+        if !self.is_in_shadow_mode && track_cost {
             tracker.cpu = tracker.cpu.saturating_add(cpu_charged);
         }
         self.cpu_insns
@@ -279,7 +291,7 @@ impl BudgetImpl {
             IsCpu(false),
             IsShadowMode(self.is_in_shadow_mode),
         )?;
-        if !self.is_in_shadow_mode {
+        if !self.is_in_shadow_mode && track_cost {
             tracker.mem = tracker.mem.saturating_add(mem_charged);
         }
         self.mem_bytes
@@ -333,7 +345,7 @@ impl BudgetImpl {
             .get_mut(ty as usize)
             .ok_or_else(|| HostError::from((ScErrorType::Budget, ScErrorCode::InternalError)))?;
 
-        if !self.is_in_shadow_mode {
+        if !self.is_in_shadow_mode && self.full_cost_tracking {
             let count_u32 = u32::try_from(total_count).unwrap_or(u32::MAX);
             self.tracker.meter_count = self.tracker.meter_count.saturating_add(count_u32);
             tracker.iterations = tracker.iterations.saturating_add(total_count);
@@ -343,6 +355,8 @@ impl BudgetImpl {
             }
             tracker.cpu = tracker.cpu.saturating_add(total_cpu);
             tracker.mem = tracker.mem.saturating_add(total_mem);
+        } else if !self.is_in_shadow_mode && !Self::validates_input_shape(tracker, Some(0)) {
+            return Err((ScErrorType::Budget, ScErrorCode::InternalError).into());
         }
 
         self.cpu_insns.charge_amount(
@@ -392,6 +406,7 @@ impl Default for BudgetImpl {
             cpu_insns: BudgetDimension::default(),
             mem_bytes: BudgetDimension::default(),
             tracker: Default::default(),
+            full_cost_tracking: true,
             is_in_shadow_mode: false,
             coalesced_host_metering: false,
             fuel_costs: load_calibrated_fuel_costs(),
@@ -1415,6 +1430,13 @@ impl Budget {
 
     pub(crate) fn coalesced_host_metering(&self) -> Result<bool, HostError> {
         Ok(self.0.try_borrow_or_err()?.coalesced_host_metering)
+    }
+
+    pub fn set_full_cost_tracking(&self, enabled: bool) -> Result<(), HostError> {
+        self.with_mut_budget(|mut budget| {
+            budget.full_cost_tracking = enabled;
+            Ok(())
+        })
     }
 
     /// Batched `ValSer` charge keyed by `(input_len, count)` pairs. Equivalent

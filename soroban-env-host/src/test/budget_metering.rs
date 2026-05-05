@@ -235,6 +235,57 @@ fn metered_xdr_out_of_budget() -> Result<(), HostError> {
 }
 
 #[test]
+fn production_budget_tracking_mode() -> Result<(), HostError> {
+    let run_charges = |budget: &Budget| -> Result<(), HostError> {
+        budget.charge(ContractCostType::MemCpy, Some(11))?;
+        budget.bulk_charge(ContractCostType::WasmInsnExec, 7, None)?;
+        budget.charge(ContractCostType::VmInstantiation, Some(13))?;
+        budget.track_time(ContractCostType::VmInstantiation, 17)
+    };
+
+    let full = Budget::default();
+    run_charges(&full)?;
+
+    let production = Budget::default();
+    production.set_full_cost_tracking(false)?;
+    run_charges(&production)?;
+
+    assert_eq!(
+        production.get_cpu_insns_consumed()?,
+        full.get_cpu_insns_consumed()?
+    );
+    assert_eq!(
+        production.get_mem_bytes_consumed()?,
+        full.get_mem_bytes_consumed()?
+    );
+    assert_eq!(
+        production.get_tracker(ContractCostType::VmInstantiation)?.cpu,
+        full.get_tracker(ContractCostType::VmInstantiation)?.cpu
+    );
+    assert_eq!(
+        production.get_time(ContractCostType::VmInstantiation)?,
+        full.get_time(ContractCostType::VmInstantiation)?
+    );
+    assert_eq!(
+        production.get_tracker(ContractCostType::MemCpy)?.iterations,
+        0
+    );
+    assert_eq!(
+        production
+            .get_tracker(ContractCostType::WasmInsnExec)?
+            .iterations,
+        0
+    );
+
+    let res = production.charge(ContractCostType::MemCpy, None);
+    assert!(HostError::result_matches_err(
+        res,
+        (ScErrorType::Budget, ScErrorCode::InternalError)
+    ));
+    Ok(())
+}
+
+#[test]
 fn map_insert_key_vec_obj() -> Result<(), HostError> {
     let mut host = Host::test_host_with_prng().test_budget(1000, 1000);
     let mut m = host.map_new()?;
