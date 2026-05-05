@@ -147,16 +147,15 @@ fn balance_value_from_scval(e: &Host, scv: &ScVal) -> Result<BalanceValue, HostE
     })
 }
 
-fn read_contract_balance(
-    e: &Host,
-    key: &Rc<LedgerKey>,
-) -> Result<Option<BalanceValue>, HostError> {
+fn read_contract_balance(e: &Host, key: &Rc<LedgerKey>) -> Result<Option<BalanceValue>, HostError> {
     let entry = {
         let mut storage = e.try_borrow_storage_mut()?;
         storage.try_get(key, e, None)?
     };
     match entry.as_ref().map(|entry| &entry.data) {
-        Some(LedgerEntryData::ContractData(data)) => Ok(Some(balance_value_from_scval(e, &data.val)?)),
+        Some(LedgerEntryData::ContractData(data)) => {
+            Ok(Some(balance_value_from_scval(e, &data.val)?))
+        }
         Some(_) => Err(e.err(
             ScErrorType::Storage,
             ScErrorCode::InternalError,
@@ -164,6 +163,56 @@ fn read_contract_balance(
             &[],
         )),
         None => Ok(None),
+    }
+}
+
+fn is_contract_balance_authorized(
+    e: &Host,
+    balance: Option<&BalanceValue>,
+) -> Result<bool, HostError> {
+    match balance {
+        Some(balance) => Ok(balance.authorized),
+        None => Ok(!is_asset_auth_required(e)?),
+    }
+}
+
+fn balance_deauthorized_error(e: &Host) -> HostError {
+    e.error(
+        ContractError::BalanceDeauthorizedError.into(),
+        "balance is deauthorized",
+        &[],
+    )
+}
+
+enum AuthorizedBalance {
+    Account,
+    Contract(crate::xdr::ContractId, Option<BalanceValue>),
+}
+
+fn read_authorized_balance(e: &Host, addr: Address) -> Result<AuthorizedBalance, HostError> {
+    match addr.to_sc_address()? {
+        ScAddress::Account(acc_id) => {
+            if !is_account_authorized(e, acc_id)? {
+                return Err(balance_deauthorized_error(e));
+            }
+            Ok(AuthorizedBalance::Account)
+        }
+        ScAddress::Contract(id) => {
+            let key = contract_balance_ledger_key(e, ScAddress::Contract(id.metered_clone(e)?))?;
+            let balance = read_contract_balance(e, &key)?;
+
+            if !is_contract_balance_authorized(e, balance.as_ref())? {
+                return Err(balance_deauthorized_error(e));
+            }
+
+            Ok(AuthorizedBalance::Contract(id, balance))
+        }
+        _ => Err(e.err(
+            ScErrorType::Object,
+            ScErrorCode::InternalError,
+            "Unexpected ScAddress type",
+            &[addr.as_object().into()],
+        )),
     }
 }
 
@@ -279,12 +328,19 @@ fn write_contract_balance(
 
 // Metering: covered by components.
 pub(crate) fn receive_balance(e: &Host, addr: Address, amount: i128) -> Result<(), HostError> {
+    if e.budget_ref().coalesced_host_metering()? {
+        receive_balance_coalesced(e, addr, amount)
+    } else {
+        receive_balance_legacy(e, addr, amount)
+    }
+}
+
+// Original two-read path. Preserved to keep p26 metering observations
+// byte-identical. See `receive_balance_coalesced` for the next-protocol
+// single-read path.
+fn receive_balance_legacy(e: &Host, addr: Address, amount: i128) -> Result<(), HostError> {
     if !is_authorized(e, addr.metered_clone(e)?)? {
-        return Err(e.error(
-            ContractError::BalanceDeauthorizedError.into(),
-            "balance is deauthorized",
-            &[],
-        ));
+        return Err(balance_deauthorized_error(e));
     }
 
     match addr.to_sc_address()? {
@@ -331,6 +387,94 @@ pub(crate) fn receive_balance(e: &Host, addr: Address, amount: i128) -> Result<(
     }
 }
 
+// Single-read path used only when `coalesced_host_metering` is enabled
+// (next protocol). Reads and decodes the contract `BalanceValue` once for
+// both the authorization check and the credit, removing the duplicate
+// `try_get_contract_data` + `BalanceValue` decoding paid by the legacy path.
+fn receive_balance_coalesced(e: &Host, addr: Address, amount: i128) -> Result<(), HostError> {
+    match read_authorized_balance(e, addr.metered_clone(e)?)? {
+        AuthorizedBalance::Account => {
+            let ScAddress::Account(acc_id) = addr.to_sc_address()? else {
+                return Err(e.err(
+                    ScErrorType::Object,
+                    ScErrorCode::InternalError,
+                    "Unexpected ScAddress type",
+                    &[addr.as_object().into()],
+                ));
+            };
+            let i64_amount = i64::try_from(amount).map_err(|_| {
+                e.error(
+                    ContractError::OverflowError.into(),
+                    "received amount is too large for an i64",
+                    &[],
+                )
+            })?;
+            Ok(transfer_classic_balance(e, acc_id, i64_amount, &addr)?)
+        }
+        AuthorizedBalance::Contract(id, balance) => {
+            let mut balance = match balance {
+                Some(balance) => balance,
+                None => BalanceValue {
+                    amount: 0,
+                    authorized: true,
+                    clawback: is_asset_clawback_enabled(e)?,
+                },
+            };
+
+            let new_balance = balance.amount.checked_add(amount).ok_or_else(|| {
+                e.error(
+                    ContractError::OverflowError.into(),
+                    "balance overflow in receive_balance",
+                    &[],
+                )
+            })?;
+
+            balance.amount = new_balance;
+            write_contract_balance(e, addr, balance, &id)
+        }
+    }
+}
+
+fn spend_contract_balance(
+    e: &Host,
+    addr: Address,
+    amount: i128,
+    id: &crate::xdr::ContractId,
+    balance: Option<BalanceValue>,
+) -> Result<(), HostError> {
+    if let Some(mut balance) = balance {
+        if balance.amount < amount {
+            return Err(err!(
+                e,
+                ContractError::BalanceError,
+                "balance is not sufficient to spend",
+                balance,
+                amount
+            ));
+        } else {
+            let new_balance = balance.amount.checked_sub(amount).ok_or_else(|| {
+                e.error(
+                    ContractError::OverflowError.into(),
+                    "balance overflow in spend_balance_no_authorization_check",
+                    &[],
+                )
+            })?;
+            balance.amount = new_balance;
+
+            write_contract_balance(e, addr, balance, id)?
+        }
+    } else if amount > 0 {
+        return Err(err!(
+            e,
+            ContractError::BalanceError,
+            "zero balance is not sufficient to spend",
+            amount
+        ));
+    }
+
+    Ok(())
+}
+
 // Metering: covered by components.
 pub(crate) fn spend_balance_no_authorization_check(
     e: &Host,
@@ -352,36 +496,7 @@ pub(crate) fn spend_balance_no_authorization_check(
             // If a balance exists, calculate new amount and write the existing authorized state as is because
             // this can be used to clawback when deauthorized.
             let key = contract_balance_ledger_key(e, ScAddress::Contract(id.metered_clone(e)?))?;
-            if let Some(mut balance) = read_contract_balance(e, &key)? {
-                if balance.amount < amount {
-                    return Err(err!(
-                        e,
-                        ContractError::BalanceError,
-                        "balance is not sufficient to spend",
-                        balance,
-                        amount
-                    ));
-                } else {
-                    let new_balance = balance.amount.checked_sub(amount).ok_or_else(|| {
-                        e.error(
-                            ContractError::OverflowError.into(),
-                            "balance overflow in spend_balance_no_authorization_check",
-                            &[],
-                        )
-                    })?;
-                    balance.amount = new_balance;
-
-                    write_contract_balance(e, addr, balance, &id)?
-                }
-            } else if amount > 0 {
-                return Err(err!(
-                    e,
-                    ContractError::BalanceError,
-                    "zero balance is not sufficient to spend",
-                    amount
-                ));
-            }
-            Ok(())
+            spend_contract_balance(e, addr, amount, &id, read_contract_balance(e, &key)?)
         }
         _ => Err(e.err(
             ScErrorType::Object,
@@ -394,15 +509,19 @@ pub(crate) fn spend_balance_no_authorization_check(
 
 // Metering: covered by components.
 pub(crate) fn spend_balance(e: &Host, addr: Address, amount: i128) -> Result<(), HostError> {
-    if !is_authorized(e, addr.metered_clone(e)?)? {
-        return Err(e.error(
-            ContractError::BalanceDeauthorizedError.into(),
-            "balance is deauthorized",
-            &[],
-        ));
+    if e.budget_ref().coalesced_host_metering()? {
+        match read_authorized_balance(e, addr.metered_clone(e)?)? {
+            AuthorizedBalance::Account => spend_balance_no_authorization_check(e, addr, amount),
+            AuthorizedBalance::Contract(id, balance) => {
+                spend_contract_balance(e, addr, amount, &id, balance)
+            }
+        }
+    } else {
+        if !is_authorized(e, addr.metered_clone(e)?)? {
+            return Err(balance_deauthorized_error(e));
+        }
+        spend_balance_no_authorization_check(e, addr, amount)
     }
-
-    spend_balance_no_authorization_check(e, addr, amount)
 }
 
 // Metering: covered by components.
