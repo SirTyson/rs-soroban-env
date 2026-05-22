@@ -1,5 +1,8 @@
 use crate::{
     auth::AuthorizationManagerSnapshot,
+    builtin_contracts::stellar_asset_contract::{
+        read_contract_balance_for_contract_owner, INSTANCE_EXTEND_AMOUNT, INSTANCE_TTL_THRESHOLD,
+    },
     budget::AsBudget,
     err,
     host::{
@@ -1349,6 +1352,9 @@ impl Host {
         owner: AddressObject,
     ) -> Result<i128, HostError> {
         let token_id = self.contract_id_from_address(token)?;
+        if let Some(balance) = self.soroswap_pool_read_sac_contract_balance(&token_id, owner)? {
+            return Ok(balance);
+        }
         let func = self.symbol_new_from_slice(b"balance")?;
         let res = self.call_n_internal(
             &token_id,
@@ -1357,6 +1363,28 @@ impl Host {
             CallParams::default_external_call(),
         )?;
         Ok(i128::try_from_val(self, &res)?)
+    }
+
+    fn soroswap_pool_read_sac_contract_balance(
+        &self,
+        token_id: &ContractId,
+        owner: AddressObject,
+    ) -> Result<Option<i128>, HostError> {
+        let owner_id = match self.scaddress_from_address(owner)? {
+            ScAddress::Contract(id) => id,
+            _ => return Ok(None),
+        };
+        let instance_key = self.contract_instance_ledger_key(token_id)?;
+        let instance = self.retrieve_contract_instance_from_storage(&instance_key)?;
+        if !matches!(instance.executable, ContractExecutable::StellarAsset) {
+            return Ok(None);
+        }
+        self.extend_contract_instance_ttl_from_contract_id(
+            instance_key,
+            INSTANCE_TTL_THRESHOLD,
+            INSTANCE_EXTEND_AMOUNT,
+        )?;
+        read_contract_balance_for_contract_owner(self, token_id, &owner_id).map(Some)
     }
 
     fn instantiate_vm(&self, id: &ContractId, wasm_hash: &Hash) -> Result<Rc<Vm>, HostError> {

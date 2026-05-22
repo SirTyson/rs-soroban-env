@@ -15,9 +15,9 @@ use crate::{
     xdr::{
         int128_helpers, AccountEntry, AccountEntryExt, AccountEntryExtensionV1Ext, AccountFlags,
         AccountId, Asset, ContractDataDurability, ContractDataEntry, ExtensionPoint, Int128Parts,
-        LedgerEntry, LedgerEntryData, LedgerEntryExt, LedgerKey, ScAddress, ScErrorCode,
-        ScErrorType, ScMap, ScMapEntry, ScSymbol, ScVal, ScVec, SequenceNumber, Thresholds,
-        TrustLineAsset, TrustLineEntry, TrustLineEntryExt, TrustLineFlags,
+        ContractId, LedgerEntry, LedgerEntryData, LedgerEntryExt, LedgerKey, ScAddress,
+        ScErrorCode, ScErrorType, ScMap, ScMapEntry, ScSymbol, ScVal, ScVec, SequenceNumber,
+        Thresholds, TrustLineAsset, TrustLineEntry, TrustLineEntryExt, TrustLineFlags,
     },
     ErrorHandler, Host, HostError,
 };
@@ -175,6 +175,28 @@ fn extend_contract_balance_ttl(e: &Host, key: Rc<LedgerKey>) -> Result<(), HostE
         BALANCE_EXTEND_AMOUNT,
         None,
     )
+}
+
+pub(crate) fn read_contract_balance_for_contract_owner(
+    e: &Host,
+    sac_contract_id: &ContractId,
+    owner_contract_id: &ContractId,
+) -> Result<i128, HostError> {
+    let key_scval = contract_balance_key_scval(
+        e,
+        ScAddress::Contract(owner_contract_id.metered_clone(e)?),
+    )?;
+    let key = e.storage_key_for_address(
+        ScAddress::Contract(sac_contract_id.metered_clone(e)?),
+        key_scval,
+        ContractDataDurability::Persistent,
+    )?;
+    if let Some(balance) = read_contract_balance(e, &key)? {
+        extend_contract_balance_ttl(e, key)?;
+        Ok(balance.amount)
+    } else {
+        Ok(0)
+    }
 }
 
 /// This module handles all balance and authorization related logic for both
