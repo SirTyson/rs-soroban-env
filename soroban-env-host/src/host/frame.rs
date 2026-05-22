@@ -822,6 +822,12 @@ impl Host {
         instance: &ScContractInstance,
         wasm_hash: &Hash,
     ) -> Result<Option<Val>, HostError> {
+        // Next-protocol gate: this native emulation bypasses Wasm instantiation
+        // and changes protocol-visible budget/dispatch accounting, so it must
+        // not run for the released protocol version. Keep p26 execution exact.
+        if self.get_ledger_protocol_version()? <= crate::host::MIN_LEDGER_PROTOCOL_VERSION {
+            return Ok(None);
+        }
         if wasm_hash.0.as_slice() != SOROSWAP_POOL_WASM_HASH || !args.is_empty() {
             return Ok(None);
         }
