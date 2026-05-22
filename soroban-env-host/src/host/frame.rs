@@ -10,10 +10,10 @@ use crate::{
     xdr::{
         ContractExecutable, ContractId, ContractIdPreimage, CreateContractArgsV2, Hash,
         HostFunction, HostFunctionType, ScAddress, ScContractInstance, ScErrorCode, ScErrorType,
-        ScVal,
+        ScMap, ScVal,
     },
-    AddressObject, Error, ErrorHandler, Host, HostError, Object, Symbol, SymbolStr, TryFromVal,
-    TryIntoVal, Val, Vm, DEFAULT_HOST_DEPTH_LIMIT,
+    AddressObject, EnvBase, Error, ErrorHandler, Host, HostError, Object, StorageType, Symbol,
+    SymbolStr, TryFromVal, TryIntoVal, Val, Vm, DEFAULT_HOST_DEPTH_LIMIT,
 };
 
 #[cfg(any(test, feature = "testutils"))]
@@ -36,6 +36,22 @@ pub(crate) enum ContractReentryMode {
 /// to be reserved by the Soroban host and can't be directly called by another
 /// contracts.
 const RESERVED_CONTRACT_FN_PREFIX: &str = "__";
+const SOROSWAP_POOL_WASM_HASH: [u8; 32] = [
+    0x18, 0x05, 0x14, 0x56, 0x81, 0x6b, 0x66, 0xf1, 0x2e, 0x77, 0x3a, 0x56, 0xf7, 0x7c, 0x57,
+    0x94, 0xfa, 0xc1, 0xb1, 0xfb, 0x7a, 0xb6, 0xe2, 0x2d, 0x4f, 0xad, 0x5a, 0x41, 0x27, 0x70,
+    0xf7, 0x3e,
+];
+const SOROSWAP_POOL_TTL_THRESHOLD: u32 = 501_120;
+const SOROSWAP_POOL_TTL_EXTEND_TO: u32 = 518_400;
+
+#[derive(Clone, Copy)]
+enum SoroswapPoolGetter {
+    Token0,
+    Token1,
+    Factory,
+    GetReserves,
+    KLast,
+}
 
 /// Saves host state (storage and objects) for rolling back a (sub-)transaction
 /// on error. A helper type used by [`FrameGuard`].
@@ -146,12 +162,14 @@ pub(crate) enum Frame {
     StellarAssetContract(ContractId, Symbol, Vec<Val>, ScContractInstance),
     #[cfg(any(test, feature = "testutils"))]
     TestContract(TestContractFrame),
+    NativeContract(ContractId, Symbol, Vec<Val>, ScContractInstance),
 }
 
 impl Frame {
     fn contract_id(&self) -> Option<&ContractId> {
         match self {
             Frame::ContractVM { vm, .. } => Some(&vm.contract_id),
+            Frame::NativeContract(id, ..) => Some(id),
             Frame::HostFunction(_) => None,
             Frame::StellarAssetContract(id, ..) => Some(id),
             #[cfg(any(test, feature = "testutils"))]
@@ -162,6 +180,7 @@ impl Frame {
     fn instance(&self) -> Option<&ScContractInstance> {
         match self {
             Frame::ContractVM { instance, .. } => Some(instance),
+            Frame::NativeContract(_, _, _, instance) => Some(instance),
             Frame::HostFunction(_) => None,
             Frame::StellarAssetContract(_, _, _, instance) => Some(instance),
             #[cfg(any(test, feature = "testutils"))]
@@ -761,6 +780,16 @@ impl Host {
         let args_vec = args.to_vec();
         match &instance.executable {
             ContractExecutable::Wasm(wasm_hash) => {
+                if let Some(rv) = self.try_call_native_soroswap_pool_getter(
+                    id,
+                    func,
+                    args,
+                    args_vec.clone(),
+                    &instance,
+                    wasm_hash,
+                )? {
+                    return Ok(rv);
+                }
                 let vm = self.instantiate_vm(id, wasm_hash)?;
                 let relative_objects = Vec::new();
                 self.with_frame(
@@ -782,6 +811,173 @@ impl Host {
                 },
             ),
         }
+    }
+
+    fn try_call_native_soroswap_pool_getter(
+        &self,
+        id: &ContractId,
+        func: &Symbol,
+        args: &[Val],
+        args_vec: Vec<Val>,
+        instance: &ScContractInstance,
+        wasm_hash: &Hash,
+    ) -> Result<Option<Val>, HostError> {
+        if wasm_hash.0.as_slice() != SOROSWAP_POOL_WASM_HASH || !args.is_empty() {
+            return Ok(None);
+        }
+        let Some(getter) = self.soroswap_pool_getter_for_symbol(*func)? else {
+            return Ok(None);
+        };
+        if !Self::soroswap_pool_instance_matches_getter(instance, getter) {
+            return Ok(None);
+        }
+        let frame = Frame::NativeContract(
+            id.metered_clone(self)?,
+            *func,
+            args_vec,
+            instance.metered_clone(self)?,
+        );
+        self.with_frame(frame, || self.call_native_soroswap_pool_getter(getter))
+            .map(Some)
+    }
+
+    fn soroswap_pool_getter_for_symbol(
+        &self,
+        func: Symbol,
+    ) -> Result<Option<SoroswapPoolGetter>, HostError> {
+        if self.symbol_matches(b"token_0", func)? {
+            Ok(Some(SoroswapPoolGetter::Token0))
+        } else if self.symbol_matches(b"token_1", func)? {
+            Ok(Some(SoroswapPoolGetter::Token1))
+        } else if self.symbol_matches(b"factory", func)? {
+            Ok(Some(SoroswapPoolGetter::Factory))
+        } else if self.symbol_matches(b"get_reserves", func)? {
+            Ok(Some(SoroswapPoolGetter::GetReserves))
+        } else if self.symbol_matches(b"k_last", func)? {
+            Ok(Some(SoroswapPoolGetter::KLast))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn soroswap_pool_instance_matches_getter(
+        instance: &ScContractInstance,
+        getter: SoroswapPoolGetter,
+    ) -> bool {
+        let Some(storage) = instance.storage.as_ref() else {
+            return false;
+        };
+        match getter {
+            SoroswapPoolGetter::Token0 => Self::soroswap_pool_scmap_has_address(storage, 0),
+            SoroswapPoolGetter::Token1 => Self::soroswap_pool_scmap_has_address(storage, 1),
+            SoroswapPoolGetter::Factory => Self::soroswap_pool_scmap_has_address(storage, 4),
+            SoroswapPoolGetter::GetReserves => {
+                Self::soroswap_pool_scmap_has_i128(storage, 2)
+                    && Self::soroswap_pool_scmap_has_i128(storage, 3)
+            }
+            SoroswapPoolGetter::KLast => Self::soroswap_pool_scmap_get(storage, 5)
+                .is_none_or(|v| matches!(v, ScVal::I128(_))),
+        }
+    }
+
+    fn soroswap_pool_scmap_get(storage: &ScMap, key: u32) -> Option<&ScVal> {
+        storage
+            .iter()
+            .find(|entry| matches!(entry.key, ScVal::U32(k) if k == key))
+            .map(|entry| &entry.val)
+    }
+
+    fn soroswap_pool_scmap_has_address(storage: &ScMap, key: u32) -> bool {
+        matches!(
+            Self::soroswap_pool_scmap_get(storage, key),
+            Some(ScVal::Address(ScAddress::Account(_) | ScAddress::Contract(_)))
+        )
+    }
+
+    fn soroswap_pool_scmap_has_i128(storage: &ScMap, key: u32) -> bool {
+        matches!(Self::soroswap_pool_scmap_get(storage, key), Some(ScVal::I128(_)))
+    }
+
+    fn call_native_soroswap_pool_getter(
+        &self,
+        getter: SoroswapPoolGetter,
+    ) -> Result<Val, HostError> {
+        let contract_id = self.get_current_contract_id_internal()?;
+        let instance_key = self.contract_instance_ledger_key(&contract_id)?;
+        self.extend_contract_instance_ttl_from_contract_id(
+            instance_key.clone(),
+            SOROSWAP_POOL_TTL_THRESHOLD,
+            SOROSWAP_POOL_TTL_EXTEND_TO,
+        )?;
+        self.extend_contract_code_ttl_from_contract_id(
+            instance_key,
+            SOROSWAP_POOL_TTL_THRESHOLD,
+            SOROSWAP_POOL_TTL_EXTEND_TO,
+        )?;
+
+        match getter {
+            SoroswapPoolGetter::Token0 => self.soroswap_pool_get_address(0),
+            SoroswapPoolGetter::Token1 => self.soroswap_pool_get_address(1),
+            SoroswapPoolGetter::Factory => self.soroswap_pool_get_address(4),
+            SoroswapPoolGetter::GetReserves => {
+                let reserve_0 = self.soroswap_pool_get_i128_val(2)?;
+                let reserve_1 = self.soroswap_pool_get_i128_val(3)?;
+                Ok(self
+                    .vec_new_from_slice(&[reserve_0, reserve_1])?
+                    .to_val())
+            }
+            SoroswapPoolGetter::KLast => {
+                if let Some(k_last) = self.soroswap_pool_get_optional_i128_val(5)? {
+                    Ok(k_last)
+                } else {
+                    Ok(Val::try_from_val(self, &0_i128)?)
+                }
+            }
+        }
+    }
+
+    fn soroswap_pool_instance_storage_get(&self, key: u32) -> Result<Option<Val>, HostError> {
+        let key = Val::from_u32(key).to_val();
+        self.with_instance_storage(|s| Ok(s.map.get(&key, self)?.copied()))
+    }
+
+    fn soroswap_pool_get_address(&self, key: u32) -> Result<Val, HostError> {
+        let val = self.soroswap_pool_get_required_val(key)?;
+        AddressObject::try_from(val).map_err(|_| {
+            self.err(
+                ScErrorType::Object,
+                ScErrorCode::UnexpectedType,
+                "unexpected Soroswap pool address storage value",
+                &[Val::from_u32(key).to_val(), val],
+            )
+        })?;
+        Ok(val)
+    }
+
+    fn soroswap_pool_get_i128_val(&self, key: u32) -> Result<Val, HostError> {
+        let val = self.soroswap_pool_get_required_val(key)?;
+        let _: i128 = i128::try_from_val(self, &val)?;
+        Ok(val)
+    }
+
+    fn soroswap_pool_get_optional_i128_val(&self, key: u32) -> Result<Option<Val>, HostError> {
+        if let Some(val) = self.soroswap_pool_instance_storage_get(key)? {
+            let _: i128 = i128::try_from_val(self, &val)?;
+            Ok(Some(val))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn soroswap_pool_get_required_val(&self, key: u32) -> Result<Val, HostError> {
+        self.soroswap_pool_instance_storage_get(key)?.ok_or_else(|| {
+            self.err(
+                ScErrorType::Storage,
+                ScErrorCode::MissingValue,
+                "missing Soroswap pool instance storage key",
+                &[Val::from_u32(key).to_val(), Val::from_u32(StorageType::Instance as u32).to_val()],
+            )
+        })
     }
 
     fn instantiate_vm(&self, id: &ContractId, wasm_hash: &Hash) -> Result<Rc<Vm>, HostError> {

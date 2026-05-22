@@ -1347,6 +1347,7 @@ impl AuthorizationManager {
             Frame::ContractVM { vm, fn_name, .. } => {
                 (vm.contract_id.metered_clone(host)?, *fn_name)
             }
+            Frame::NativeContract(id, fn_name, ..) => (id.metered_clone(host)?, *fn_name),
             // Skip the top-level host function stack frames as they don't
             // contain all the necessary information.
             // Use the respective push (like

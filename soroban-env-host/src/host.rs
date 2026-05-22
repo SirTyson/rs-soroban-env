@@ -3634,6 +3634,7 @@ impl VmCallerEnv for Host {
         let args = self.with_current_frame(|f| {
             let args = match f {
                 Frame::ContractVM { args, .. } => args,
+                Frame::NativeContract(_, _, args, _) => args,
                 Frame::HostFunction(_) => {
                     return Err(self.err(
                         ScErrorType::Context,

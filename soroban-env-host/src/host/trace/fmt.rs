@@ -133,6 +133,14 @@ impl TraceEvent<'_> {
                 },
                 &args,
             ),
+            Frame::NativeContract(_, fn_name, args, instance) => (
+                FrameId {
+                    ty: "NATIVE",
+                    id: (&instance.executable).into(),
+                    sym: Some(*fn_name),
+                },
+                &args,
+            ),
             #[cfg(any(test, feature = "testutils"))]
             Frame::TestContract(tc) => (
                 FrameId {
