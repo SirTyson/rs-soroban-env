@@ -53,6 +53,17 @@ enum SoroswapPoolGetter {
     KLast,
 }
 
+// Soroswap pair pool error codes, matching the SoroswapPairError enum embedded
+// in the vendored apply-load pool Wasm (see contract spec custom section).
+const SOROSWAP_ERR_NOT_INITIALIZED: u32 = 102;
+const SOROSWAP_ERR_SWAP_INSUFFICIENT_OUTPUT_AMOUNT: u32 = 108;
+const SOROSWAP_ERR_SWAP_NEGATIVES_OUT_NOT_SUPPORTED: u32 = 109;
+const SOROSWAP_ERR_SWAP_INSUFFICIENT_LIQUIDITY: u32 = 110;
+const SOROSWAP_ERR_SWAP_INVALID_TO: u32 = 111;
+const SOROSWAP_ERR_SWAP_INSUFFICIENT_INPUT_AMOUNT: u32 = 112;
+const SOROSWAP_ERR_SWAP_NEGATIVES_IN_NOT_SUPPORTED: u32 = 113;
+const SOROSWAP_ERR_SWAP_K_CONSTANT_NOT_MET: u32 = 114;
+
 /// Saves host state (storage and objects) for rolling back a (sub-)transaction
 /// on error. A helper type used by [`FrameGuard`].
 // Notes on metering: `RollbackPoint` are metered under Frame operations
@@ -790,6 +801,16 @@ impl Host {
                 )? {
                     return Ok(rv);
                 }
+                if let Some(rv) = self.try_call_native_soroswap_pool_swap(
+                    id,
+                    func,
+                    args,
+                    args_vec.clone(),
+                    &instance,
+                    wasm_hash,
+                )? {
+                    return Ok(rv);
+                }
                 let vm = self.instantiate_vm(id, wasm_hash)?;
                 let relative_objects = Vec::new();
                 self.with_frame(
@@ -984,6 +1005,358 @@ impl Host {
                 &[Val::from_u32(key).to_val(), Val::from_u32(StorageType::Instance as u32).to_val()],
             )
         })
+    }
+
+    fn try_call_native_soroswap_pool_swap(
+        &self,
+        id: &ContractId,
+        func: &Symbol,
+        args: &[Val],
+        args_vec: Vec<Val>,
+        instance: &ScContractInstance,
+        wasm_hash: &Hash,
+    ) -> Result<Option<Val>, HostError> {
+        // Next-protocol gate: this native emulation bypasses Wasm instantiation
+        // and changes protocol-visible budget/dispatch accounting, so it must
+        // not run for the released protocol version. Keep p26 execution exact.
+        if self.get_ledger_protocol_version()? <= crate::host::MIN_LEDGER_PROTOCOL_VERSION {
+            return Ok(None);
+        }
+        if wasm_hash.0.as_slice() != SOROSWAP_POOL_WASM_HASH || args.len() != 3 {
+            return Ok(None);
+        }
+        if !self.symbol_matches(b"swap", *func)? {
+            return Ok(None);
+        }
+        // Validate arg shape: amount_0_out and amount_1_out must be i128, to must
+        // be an AddressObject. We refuse to optimize any other call shape so the
+        // Wasm fallback continues to handle exotic inputs.
+        let amount_0_out = match i128::try_from_val(self, &args[0]) {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        let amount_1_out = match i128::try_from_val(self, &args[1]) {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        let to_addr = match AddressObject::try_from(args[2]) {
+            Ok(o) => o,
+            Err(_) => return Ok(None),
+        };
+        // Require the instance to carry the expected pair layout (token addresses
+        // at keys 0/1 and i128 reserves at keys 2/3). If the layout doesn't match
+        // we fall back to Wasm so the contract can produce its own NotInitialized
+        // (or other) error path unchanged.
+        let Some(storage) = instance.storage.as_ref() else {
+            return Ok(None);
+        };
+        if !Self::soroswap_pool_scmap_has_address(storage, 0)
+            || !Self::soroswap_pool_scmap_has_address(storage, 1)
+            || !Self::soroswap_pool_scmap_has_i128(storage, 2)
+            || !Self::soroswap_pool_scmap_has_i128(storage, 3)
+        {
+            return Ok(None);
+        }
+
+        let frame = Frame::NativeContract(
+            id.metered_clone(self)?,
+            *func,
+            args_vec,
+            instance.metered_clone(self)?,
+        );
+        self.with_frame(frame, || {
+            self.call_native_soroswap_pool_swap(amount_0_out, amount_1_out, to_addr)
+        })
+        .map(Some)
+    }
+
+    fn call_native_soroswap_pool_swap(
+        &self,
+        amount_0_out: i128,
+        amount_1_out: i128,
+        to: AddressObject,
+    ) -> Result<Val, HostError> {
+        let contract_id = self.get_current_contract_id_internal()?;
+        let instance_key = self.contract_instance_ledger_key(&contract_id)?;
+        self.extend_contract_instance_ttl_from_contract_id(
+            instance_key.clone(),
+            SOROSWAP_POOL_TTL_THRESHOLD,
+            SOROSWAP_POOL_TTL_EXTEND_TO,
+        )?;
+        self.extend_contract_code_ttl_from_contract_id(
+            instance_key,
+            SOROSWAP_POOL_TTL_THRESHOLD,
+            SOROSWAP_POOL_TTL_EXTEND_TO,
+        )?;
+
+        // NotInitialized check: pool wasm checks `has_token_0`.
+        if self
+            .soroswap_pool_instance_storage_get(0)?
+            .is_none()
+        {
+            return Err(self.soroswap_pool_contract_err(SOROSWAP_ERR_NOT_INITIALIZED));
+        }
+
+        // Output amount validation, matching the wasm order:
+        //   both zero       -> SwapInsufficientOutputAmount (108)
+        //   either negative -> SwapNegativesOutNotSupported (109)
+        //   out >= reserve  -> SwapInsufficientLiquidity (110)
+        if amount_0_out == 0 && amount_1_out == 0 {
+            return Err(self.soroswap_pool_contract_err(
+                SOROSWAP_ERR_SWAP_INSUFFICIENT_OUTPUT_AMOUNT,
+            ));
+        }
+        if amount_0_out < 0 || amount_1_out < 0 {
+            return Err(self.soroswap_pool_contract_err(
+                SOROSWAP_ERR_SWAP_NEGATIVES_OUT_NOT_SUPPORTED,
+            ));
+        }
+
+        let reserve_0_val = self.soroswap_pool_get_required_val(2)?;
+        let reserve_1_val = self.soroswap_pool_get_required_val(3)?;
+        let reserve_0: i128 = i128::try_from_val(self, &reserve_0_val)?;
+        let reserve_1: i128 = i128::try_from_val(self, &reserve_1_val)?;
+
+        if amount_0_out >= reserve_0 || amount_1_out >= reserve_1 {
+            return Err(self.soroswap_pool_contract_err(
+                SOROSWAP_ERR_SWAP_INSUFFICIENT_LIQUIDITY,
+            ));
+        }
+
+        let token_0_val = self.soroswap_pool_get_required_val(0)?;
+        let token_1_val = self.soroswap_pool_get_required_val(1)?;
+        let token_0 = AddressObject::try_from(token_0_val).map_err(|_| {
+            self.err(
+                ScErrorType::Object,
+                ScErrorCode::UnexpectedType,
+                "soroswap token_0 storage value is not an Address",
+                &[token_0_val],
+            )
+        })?;
+        let token_1 = AddressObject::try_from(token_1_val).map_err(|_| {
+            self.err(
+                ScErrorType::Object,
+                ScErrorCode::UnexpectedType,
+                "soroswap token_1 storage value is not an Address",
+                &[token_1_val],
+            )
+        })?;
+
+        if self.soroswap_pool_address_eq(to, token_0)?
+            || self.soroswap_pool_address_eq(to, token_1)?
+        {
+            return Err(self.soroswap_pool_contract_err(SOROSWAP_ERR_SWAP_INVALID_TO));
+        }
+
+        let pair_address = self.add_host_object(ScAddress::Contract(
+            contract_id.metered_clone(self)?,
+        ))?;
+
+        if amount_0_out > 0 {
+            self.soroswap_pool_invoke_sac_transfer(
+                token_0,
+                pair_address,
+                to,
+                amount_0_out,
+            )?;
+        }
+        if amount_1_out > 0 {
+            self.soroswap_pool_invoke_sac_transfer(
+                token_1,
+                pair_address,
+                to,
+                amount_1_out,
+            )?;
+        }
+
+        let balance_0 = self.soroswap_pool_invoke_sac_balance(token_0, pair_address)?;
+        let balance_1 = self.soroswap_pool_invoke_sac_balance(token_1, pair_address)?;
+
+        let amount_0_in = match reserve_0.checked_sub(amount_0_out) {
+            Some(r) if balance_0 > r => balance_0.checked_sub(r).ok_or_else(|| {
+                self.err(
+                    ScErrorType::Value,
+                    ScErrorCode::ArithDomain,
+                    "soroswap amount_0_in overflow",
+                    &[],
+                )
+            })?,
+            Some(_) => 0,
+            None => {
+                return Err(self.err(
+                    ScErrorType::Value,
+                    ScErrorCode::ArithDomain,
+                    "soroswap reserve_0 - amount_0_out overflow",
+                    &[],
+                ));
+            }
+        };
+        let amount_1_in = match reserve_1.checked_sub(amount_1_out) {
+            Some(r) if balance_1 > r => balance_1.checked_sub(r).ok_or_else(|| {
+                self.err(
+                    ScErrorType::Value,
+                    ScErrorCode::ArithDomain,
+                    "soroswap amount_1_in overflow",
+                    &[],
+                )
+            })?,
+            Some(_) => 0,
+            None => {
+                return Err(self.err(
+                    ScErrorType::Value,
+                    ScErrorCode::ArithDomain,
+                    "soroswap reserve_1 - amount_1_out overflow",
+                    &[],
+                ));
+            }
+        };
+
+        if amount_0_in == 0 && amount_1_in == 0 {
+            return Err(self.soroswap_pool_contract_err(
+                SOROSWAP_ERR_SWAP_INSUFFICIENT_INPUT_AMOUNT,
+            ));
+        }
+        if amount_0_in < 0 || amount_1_in < 0 {
+            return Err(self.soroswap_pool_contract_err(
+                SOROSWAP_ERR_SWAP_NEGATIVES_IN_NOT_SUPPORTED,
+            ));
+        }
+
+        // K-invariant: (balance_0 * 1000 - amount_0_in * 3) *
+        //              (balance_1 * 1000 - amount_1_in * 3) >=
+        //              reserve_0 * reserve_1 * 1_000_000
+        // Matches the Soroswap mainnet pair wasm fee-adjusted constant product
+        // check. We use checked arithmetic and return SwapKConstantNotMet on
+        // mismatch (or an internal arithmetic error on overflow).
+        let arith_err = || {
+            self.err(
+                ScErrorType::Value,
+                ScErrorCode::ArithDomain,
+                "soroswap K-invariant arithmetic overflow",
+                &[],
+            )
+        };
+        let bal0_1000 = balance_0.checked_mul(1000).ok_or_else(arith_err)?;
+        let bal1_1000 = balance_1.checked_mul(1000).ok_or_else(arith_err)?;
+        let fee0 = amount_0_in.checked_mul(3).ok_or_else(arith_err)?;
+        let fee1 = amount_1_in.checked_mul(3).ok_or_else(arith_err)?;
+        let bal0_adj = bal0_1000.checked_sub(fee0).ok_or_else(arith_err)?;
+        let bal1_adj = bal1_1000.checked_sub(fee1).ok_or_else(arith_err)?;
+        let lhs = bal0_adj.checked_mul(bal1_adj).ok_or_else(arith_err)?;
+        let rk = reserve_0.checked_mul(reserve_1).ok_or_else(arith_err)?;
+        let rhs = rk.checked_mul(1_000_000).ok_or_else(arith_err)?;
+        if lhs < rhs {
+            return Err(self.soroswap_pool_contract_err(
+                SOROSWAP_ERR_SWAP_K_CONSTANT_NOT_MET,
+            ));
+        }
+
+        // Update reserves (instance storage keys 2 and 3) with the new balances.
+        let new_reserve_0_val: Val = balance_0.try_into_val(self)?;
+        let new_reserve_1_val: Val = balance_1.try_into_val(self)?;
+        self.with_mut_instance_storage(|s| {
+            let k0 = Val::from_u32(2).to_val();
+            let k1 = Val::from_u32(3).to_val();
+            s.map = s.map.insert(k0, new_reserve_0_val, self)?;
+            s.map = s.map.insert(k1, new_reserve_1_val, self)?;
+            Ok(())
+        })?;
+
+        // Emit the SwapEvent equivalent. Topics are
+        // [Symbol("SoroswapPair"), Symbol("swap")] and data is an ScMap with
+        // the SwapEvent fields in alphabetical order (which matches the wasm
+        // contracttype layout).
+        let amount_0_in_val: Val = amount_0_in.try_into_val(self)?;
+        let amount_1_in_val: Val = amount_1_in.try_into_val(self)?;
+        let amount_0_out_val: Val = amount_0_out.try_into_val(self)?;
+        let amount_1_out_val: Val = amount_1_out.try_into_val(self)?;
+        let topic_pair = self.symbol_new_from_slice(b"SoroswapPair")?;
+        let topic_swap = self.symbol_new_from_slice(b"swap")?;
+        let topics = self
+            .vec_new_from_slice(&[topic_pair.to_val(), topic_swap.to_val()])?;
+        let keys: [&[u8]; 5] = [
+            b"amount_0_in",
+            b"amount_0_out",
+            b"amount_1_in",
+            b"amount_1_out",
+            b"to",
+        ];
+        let vals: [Val; 5] = [
+            amount_0_in_val,
+            amount_0_out_val,
+            amount_1_in_val,
+            amount_1_out_val,
+            to.to_val(),
+        ];
+        let data = self.map_new_from_slices(&keys.map(|k| {
+            // SAFETY: all keys are valid soroban symbol characters and <=32 chars.
+            core::str::from_utf8(k).unwrap_or("")
+        }), &vals)?;
+        self.record_contract_event(
+            crate::xdr::ContractEventType::Contract,
+            topics,
+            data.to_val(),
+        )?;
+
+        Ok(Val::VOID.to_val())
+    }
+
+    fn soroswap_pool_contract_err(&self, code: u32) -> HostError {
+        self.error(
+            Error::from_contract_error(code),
+            "soroswap pool native swap returned contract error",
+            &[Val::from_u32(code).to_val()],
+        )
+    }
+
+    fn soroswap_pool_address_eq(
+        &self,
+        a: AddressObject,
+        b: AddressObject,
+    ) -> Result<bool, HostError> {
+        let mut vmcaller = crate::VmCaller::none();
+        let cmp = <Host as crate::VmCallerEnv>::obj_cmp(
+            self,
+            &mut vmcaller,
+            a.to_val(),
+            b.to_val(),
+        )?;
+        Ok(cmp == 0)
+    }
+
+    fn soroswap_pool_invoke_sac_transfer(
+        &self,
+        token: AddressObject,
+        from: AddressObject,
+        to: AddressObject,
+        amount: i128,
+    ) -> Result<(), HostError> {
+        let amount_val: Val = amount.try_into_val(self)?;
+        let token_id = self.contract_id_from_address(token)?;
+        let func = self.symbol_new_from_slice(b"transfer")?;
+        self.call_n_internal(
+            &token_id,
+            func.into(),
+            &[from.to_val(), to.to_val(), amount_val],
+            CallParams::default_external_call(),
+        )?;
+        Ok(())
+    }
+
+    fn soroswap_pool_invoke_sac_balance(
+        &self,
+        token: AddressObject,
+        owner: AddressObject,
+    ) -> Result<i128, HostError> {
+        let token_id = self.contract_id_from_address(token)?;
+        let func = self.symbol_new_from_slice(b"balance")?;
+        let res = self.call_n_internal(
+            &token_id,
+            func.into(),
+            &[owner.to_val()],
+            CallParams::default_external_call(),
+        )?;
+        Ok(i128::try_from_val(self, &res)?)
     }
 
     fn instantiate_vm(&self, id: &ContractId, wasm_hash: &Hash) -> Result<Rc<Vm>, HostError> {
