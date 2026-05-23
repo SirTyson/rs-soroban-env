@@ -119,6 +119,46 @@ impl Host {
         self.extract_contract_instance_from_ledger_entry(&entry)
     }
 
+    /// Peeks at the `ContractExecutable` discriminant of an existing contract
+    /// instance ledger entry without cloning the entry's full
+    /// `ScContractInstance` value. Used by performance-sensitive paths that
+    /// only need to know whether the executable is `StellarAsset` (e.g., the
+    /// native Soroswap pair fast path) and can avoid the heavyweight
+    /// `metered_clone` of the instance storage map.
+    ///
+    /// Returns `Ok(true)` if the entry is present and its executable is
+    /// `ContractExecutable::StellarAsset`. Returns `Ok(false)` for any other
+    /// existing-instance shape, or `Err(...)` if the entry exists but is not a
+    /// valid contract-instance ledger entry. Missing entries are surfaced as
+    /// storage `MissingValue` errors (matching `get`'s behavior) so callers
+    /// get the same footprint/ttl error reporting they'd see when loading the
+    /// instance the normal way.
+    pub(crate) fn contract_instance_executable_is_stellar_asset(
+        &self,
+        key: &Rc<LedgerKey>,
+    ) -> Result<bool, HostError> {
+        let entry = self.try_borrow_storage_mut()?.get(key, self, None)?;
+        match &entry.data {
+            LedgerEntryData::ContractData(e) => match &e.val {
+                ScVal::ContractInstance(instance) => {
+                    Ok(matches!(instance.executable, ContractExecutable::StellarAsset))
+                }
+                _ => Err(self.err(
+                    ScErrorType::Storage,
+                    ScErrorCode::InternalError,
+                    "ledger entry for contract instance does not contain contract instance",
+                    &[],
+                )),
+            },
+            _ => Err(self.err(
+                ScErrorType::Storage,
+                ScErrorCode::InternalError,
+                "expected ContractData ledger entry",
+                &[],
+            )),
+        }
+    }
+
     pub(crate) fn contract_code_ledger_key(
         &self,
         wasm_hash: &Hash,

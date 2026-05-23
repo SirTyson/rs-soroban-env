@@ -1375,8 +1375,13 @@ impl Host {
             _ => return Ok(None),
         };
         let instance_key = self.contract_instance_ledger_key(token_id)?;
-        let instance = self.retrieve_contract_instance_from_storage(&instance_key)?;
-        if !matches!(instance.executable, ContractExecutable::StellarAsset) {
+        // Peek at the instance's executable discriminant only — avoids the
+        // metered_clone of the full `ScContractInstance` (including its
+        // instance-storage `ScMap`) that `retrieve_contract_instance_from_storage`
+        // would perform. The instance storage is irrelevant for SAC balance
+        // reads; we only need to confirm the executable is `StellarAsset` so
+        // we can mirror SAC `balance`'s storage side effects directly.
+        if !self.contract_instance_executable_is_stellar_asset(&instance_key)? {
             return Ok(None);
         }
         self.extend_contract_instance_ttl_from_contract_id(
