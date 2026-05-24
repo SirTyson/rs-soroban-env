@@ -229,6 +229,7 @@ fn get_ledger_changes(
     init_entry_metadata: Option<&[Option<InitialEntryMetadata>]>,
     min_live_until_ledger: u32,
     restored_keys: &Option<RestoredKeySet>,
+    populate_encoded_key: bool,
     #[cfg(any(test, feature = "recording_mode"))] current_ledger_seq: u32,
 ) -> Result<Vec<LedgerEntryChange>, HostError> {
     // Skip allocation metering for this for the sake of simplicity - the
@@ -245,18 +246,44 @@ fn get_ledger_changes(
             ScErrorCode::InternalError,
         ))
     };
+    let mut scratch_key_buf: Vec<u8> = vec![];
     for (pos, (key, entry_with_live_until_ledger)) in storage.map.iter(budget)?.enumerate() {
         let mut entry_change = LedgerEntryChange::default();
-        metered_write_xdr(budget, key.as_ref(), &mut entry_change.encoded_key)?;
         let durability = get_key_durability(key);
         let initial_metadata = init_entry_metadata
             .and_then(|metadata| metadata.get(pos))
             .and_then(Option::as_ref);
 
+        // Decide whether the encoded LedgerKey bytes are actually needed:
+        // - If the public `encoded_key` field is consumed downstream (recording
+        //   mode / simulation) we always serialize into it.
+        // - Otherwise we only need the bytes as scratch for sha256 hashing
+        //   when no cached TTL key_hash is available.
+        let need_key_hash_fallback = durability.is_some()
+            && initial_metadata
+                .and_then(|metadata| metadata.ttl_entry.as_ref())
+                .is_none();
+        let need_encoded_key = populate_encoded_key || need_key_hash_fallback;
+        if need_encoded_key {
+            if populate_encoded_key {
+                metered_write_xdr(budget, key.as_ref(), &mut entry_change.encoded_key)?;
+            } else {
+                scratch_key_buf.clear();
+                metered_write_xdr(budget, key.as_ref(), &mut scratch_key_buf)?;
+            }
+        }
+
         if let Some(durability) = durability {
             let key_hash = match initial_metadata.and_then(|metadata| metadata.ttl_entry.as_ref()) {
                 Some(ttl_entry) => ttl_entry.key_hash.0.to_vec(),
-                None => sha256_hash_from_bytes(entry_change.encoded_key.as_slice(), budget)?,
+                None => {
+                    let key_bytes = if populate_encoded_key {
+                        entry_change.encoded_key.as_slice()
+                    } else {
+                        scratch_key_buf.as_slice()
+                    };
+                    sha256_hash_from_bytes(key_bytes, budget)?
+                }
             };
 
             entry_change.ttl_change = Some(LedgerEntryLiveUntilChange {
@@ -485,6 +512,85 @@ pub fn invoke_host_function<T: AsRef<[u8]>, I: ExactSizeIterator<Item = T>>(
     trace_hook: Option<TraceHook>,
     module_cache: Option<ModuleCache>,
 ) -> Result<InvokeHostFunctionResult, HostError> {
+    invoke_host_function_internal(
+        budget,
+        enable_diagnostics,
+        encoded_host_fn,
+        encoded_resources,
+        restored_rw_entry_indices,
+        encoded_source_account,
+        encoded_auth_entries,
+        ledger_info,
+        encoded_ledger_entries,
+        encoded_ttl_entries,
+        base_prng_seed,
+        diagnostic_events,
+        trace_hook,
+        module_cache,
+        /* populate_ledger_change_encoded_keys */ true,
+    )
+}
+
+/// Same as [`invoke_host_function`] but omits the per-entry `encoded_key`
+/// bytes in the returned `LedgerEntryChange`s. Use this when the caller
+/// does not consume `encoded_key` (e.g. the stellar-core bridge apply
+/// path, which extracts only `read_only`, `encoded_new_value`, and
+/// `ttl_change`). Avoids one metered `LedgerKey` XDR serialization per
+/// footprint entry that already has cached TTL metadata.
+#[allow(clippy::too_many_arguments)]
+pub fn invoke_host_function_for_apply<T: AsRef<[u8]>, I: ExactSizeIterator<Item = T>>(
+    budget: &Budget,
+    enable_diagnostics: bool,
+    encoded_host_fn: T,
+    encoded_resources: T,
+    restored_rw_entry_indices: &[u32],
+    encoded_source_account: T,
+    encoded_auth_entries: I,
+    ledger_info: LedgerInfo,
+    encoded_ledger_entries: I,
+    encoded_ttl_entries: I,
+    base_prng_seed: T,
+    diagnostic_events: &mut Vec<DiagnosticEvent>,
+    trace_hook: Option<TraceHook>,
+    module_cache: Option<ModuleCache>,
+) -> Result<InvokeHostFunctionResult, HostError> {
+    invoke_host_function_internal(
+        budget,
+        enable_diagnostics,
+        encoded_host_fn,
+        encoded_resources,
+        restored_rw_entry_indices,
+        encoded_source_account,
+        encoded_auth_entries,
+        ledger_info,
+        encoded_ledger_entries,
+        encoded_ttl_entries,
+        base_prng_seed,
+        diagnostic_events,
+        trace_hook,
+        module_cache,
+        /* populate_ledger_change_encoded_keys */ false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn invoke_host_function_internal<T: AsRef<[u8]>, I: ExactSizeIterator<Item = T>>(
+    budget: &Budget,
+    enable_diagnostics: bool,
+    encoded_host_fn: T,
+    encoded_resources: T,
+    restored_rw_entry_indices: &[u32],
+    encoded_source_account: T,
+    encoded_auth_entries: I,
+    ledger_info: LedgerInfo,
+    encoded_ledger_entries: I,
+    encoded_ttl_entries: I,
+    base_prng_seed: T,
+    diagnostic_events: &mut Vec<DiagnosticEvent>,
+    trace_hook: Option<TraceHook>,
+    module_cache: Option<ModuleCache>,
+    populate_ledger_change_encoded_keys: bool,
+) -> Result<InvokeHostFunctionResult, HostError> {
     let _span0 = tracy_span!("invoke_host_function");
 
     let resources: SorobanResources =
@@ -574,6 +680,7 @@ pub fn invoke_host_function<T: AsRef<[u8]>, I: ExactSizeIterator<Item = T>>(
             Some(&init_entry_metadata),
             min_live_until_ledger,
             &restored_keys,
+            populate_ledger_change_encoded_keys,
             #[cfg(any(test, feature = "recording_mode"))]
             current_ledger_seq,
         )?;
@@ -904,6 +1011,7 @@ pub fn invoke_host_function_in_recording_mode(
             Some(&init_entry_metadata),
             min_live_until_ledger,
             &restored_keys,
+            true,
             ledger_seq,
         )?;
         // Add the keys that only exist in the footprint, but not in the
