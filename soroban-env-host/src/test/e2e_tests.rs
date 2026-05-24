@@ -10,8 +10,9 @@ use crate::{
     budget::{AsBudget, Budget},
     builtin_contracts::testutils::TestSigner,
     e2e_invoke::{
-        entry_size_for_rent, invoke_host_function, invoke_host_function_in_recording_mode,
-        ledger_entry_to_ledger_key, LedgerEntryChange, LedgerEntryLiveUntilChange,
+        entry_size_for_rent, invoke_host_function, invoke_host_function_for_apply,
+        invoke_host_function_in_recording_mode, ledger_entry_to_ledger_key,
+        InvokeHostFunctionResult, LedgerEntryChange, LedgerEntryLiveUntilChange,
         RecordingInvocationAuthMode,
     },
     e2e_testutils::{
@@ -214,6 +215,12 @@ struct InvokeHostFunctionHelperResult {
     budget: Budget,
 }
 
+struct RawInvokeHostFunctionHelperResult {
+    result: InvokeHostFunctionResult,
+    diagnostic_events: Vec<DiagnosticEvent>,
+    budget: Budget,
+}
+
 #[derive(Debug)]
 struct InvokeHostFunctionRecordingHelperResult {
     invoke_result: Result<ScVal, HostError>,
@@ -261,7 +268,7 @@ impl AsBudget for E2eTestCompilationContext {
 }
 impl crate::CompilationContext for E2eTestCompilationContext {}
 
-fn invoke_host_function_helper_with_restored_entries(
+fn raw_invoke_host_function_helper_with_restored_entries(
     enable_diagnostics: bool,
     host_fn: &HostFunction,
     resources: &SorobanResources,
@@ -271,7 +278,33 @@ fn invoke_host_function_helper_with_restored_entries(
     ledger_entries_with_ttl: Vec<(LedgerEntry, Option<u32>)>,
     prng_seed: &[u8; 32],
     restored_entry_ids: &[u32],
-) -> Result<InvokeHostFunctionHelperResult, HostError> {
+) -> Result<RawInvokeHostFunctionHelperResult, HostError> {
+    raw_invoke_host_function_helper_with_restored_entries_and_apply_mode(
+        enable_diagnostics,
+        host_fn,
+        resources,
+        source_account,
+        auth_entries,
+        ledger_info,
+        ledger_entries_with_ttl,
+        prng_seed,
+        restored_entry_ids,
+        false,
+    )
+}
+
+fn raw_invoke_host_function_helper_with_restored_entries_and_apply_mode(
+    enable_diagnostics: bool,
+    host_fn: &HostFunction,
+    resources: &SorobanResources,
+    source_account: &AccountId,
+    auth_entries: Vec<SorobanAuthorizationEntry>,
+    ledger_info: &LedgerInfo,
+    ledger_entries_with_ttl: Vec<(LedgerEntry, Option<u32>)>,
+    prng_seed: &[u8; 32],
+    restored_entry_ids: &[u32],
+    for_apply: bool,
+) -> Result<RawInvokeHostFunctionHelperResult, HostError> {
     let limits = Limits::none();
     let encoded_host_fn = host_fn.to_xdr(limits.clone()).unwrap();
     let encoded_resources = resources.to_xdr(limits.clone()).unwrap();
@@ -325,32 +358,86 @@ fn invoke_host_function_helper_with_restored_entries(
         .reset_cpu_limit(resources.instructions as u64)
         .unwrap();
     let mut diagnostic_events = Vec::<DiagnosticEvent>::new();
-    let res = invoke_host_function(
-        &budget,
+    let res = if for_apply {
+        invoke_host_function_for_apply(
+            &budget,
+            enable_diagnostics,
+            encoded_host_fn,
+            encoded_resources,
+            restored_entry_ids,
+            encoded_source_account,
+            encoded_auth_entries.into_iter(),
+            ledger_info.clone(),
+            encoded_ledger_entries.into_iter(),
+            encoded_ttl_entries.into_iter(),
+            prng_seed.to_vec(),
+            &mut diagnostic_events,
+            None,
+            Some(module_cache),
+        )?
+    } else {
+        invoke_host_function(
+            &budget,
+            enable_diagnostics,
+            encoded_host_fn,
+            encoded_resources,
+            restored_entry_ids,
+            encoded_source_account,
+            encoded_auth_entries.into_iter(),
+            ledger_info.clone(),
+            encoded_ledger_entries.into_iter(),
+            encoded_ttl_entries.into_iter(),
+            prng_seed.to_vec(),
+            &mut diagnostic_events,
+            None,
+            Some(module_cache),
+        )?
+    };
+    Ok(RawInvokeHostFunctionHelperResult {
+        result: res,
+        diagnostic_events,
+        budget,
+    })
+}
+
+fn invoke_host_function_helper_with_restored_entries(
+    enable_diagnostics: bool,
+    host_fn: &HostFunction,
+    resources: &SorobanResources,
+    source_account: &AccountId,
+    auth_entries: Vec<SorobanAuthorizationEntry>,
+    ledger_info: &LedgerInfo,
+    ledger_entries_with_ttl: Vec<(LedgerEntry, Option<u32>)>,
+    prng_seed: &[u8; 32],
+    restored_entry_ids: &[u32],
+) -> Result<InvokeHostFunctionHelperResult, HostError> {
+    let limits = Limits::none();
+    let RawInvokeHostFunctionHelperResult {
+        result,
+        diagnostic_events,
+        budget,
+    } = raw_invoke_host_function_helper_with_restored_entries(
         enable_diagnostics,
-        encoded_host_fn,
-        encoded_resources,
+        host_fn,
+        resources,
+        source_account,
+        auth_entries,
+        ledger_info,
+        ledger_entries_with_ttl,
+        prng_seed,
         restored_entry_ids,
-        encoded_source_account,
-        encoded_auth_entries.into_iter(),
-        ledger_info.clone(),
-        encoded_ledger_entries.into_iter(),
-        encoded_ttl_entries.into_iter(),
-        prng_seed.to_vec(),
-        &mut diagnostic_events,
-        None,
-        Some(module_cache),
     )?;
+    let contract_events = result
+        .encoded_contract_events
+        .iter()
+        .map(|v| ContractEvent::from_xdr(v, limits.clone()).unwrap())
+        .collect();
     Ok(InvokeHostFunctionHelperResult {
-        invoke_result: res
+        invoke_result: result
             .encoded_invoke_result
             .map(|v| ScVal::from_xdr(v, limits.clone()).unwrap()),
-        ledger_changes: res.ledger_changes.into_iter().map(|c| c.into()).collect(),
-        contract_events: res
-            .encoded_contract_events
-            .iter()
-            .map(|v| ContractEvent::from_xdr(v, limits.clone()).unwrap())
-            .collect(),
+        ledger_changes: result.ledger_changes.into_iter().map(|c| c.into()).collect(),
+        contract_events,
         diagnostic_events,
         budget,
     })
@@ -1154,6 +1241,107 @@ fn test_wasm_upload_success_with_extra_footprint_entries() {
     );
     assert!(res.budget.get_cpu_insns_consumed().unwrap() > 0);
     assert!(res.budget.get_mem_bytes_consumed().unwrap() > 0);
+}
+
+#[test]
+fn test_apply_invoke_preserves_budget_while_omitting_encoded_keys() {
+    let ledger_info = default_ledger_info();
+    let source_account = get_account_id([123; 32]);
+    let host_fn = upload_wasm_host_fn(ADD_I32);
+    let resources = resources(
+        10_000_000,
+        vec![get_wasm_key(CONTRACT_STORAGE)],
+        vec![get_wasm_key(ADD_I32), get_wasm_key(LINEAR_MEMORY)],
+    );
+    let ledger_entries_with_ttl = vec![(
+        wasm_entry(LINEAR_MEMORY),
+        Some(ledger_info.sequence_number + 1000),
+    )];
+
+    let dense = raw_invoke_host_function_helper_with_restored_entries_and_apply_mode(
+        true,
+        &host_fn,
+        &resources,
+        &source_account,
+        vec![],
+        &ledger_info,
+        ledger_entries_with_ttl.clone(),
+        &prng_seed(),
+        &[],
+        false,
+    )
+    .unwrap();
+    let apply = raw_invoke_host_function_helper_with_restored_entries_and_apply_mode(
+        true,
+        &host_fn,
+        &resources,
+        &source_account,
+        vec![],
+        &ledger_info,
+        ledger_entries_with_ttl,
+        &prng_seed(),
+        &[],
+        true,
+    )
+    .unwrap();
+
+    assert!(dense.result.encoded_invoke_result.is_ok());
+    assert_eq!(
+        dense.result.encoded_invoke_result.as_ref().unwrap(),
+        apply.result.encoded_invoke_result.as_ref().unwrap()
+    );
+    assert_eq!(
+        dense.result.encoded_contract_events,
+        apply.result.encoded_contract_events
+    );
+    assert_eq!(dense.diagnostic_events, apply.diagnostic_events);
+    assert_eq!(
+        dense.budget.get_cpu_insns_consumed().unwrap(),
+        apply.budget.get_cpu_insns_consumed().unwrap()
+    );
+    assert_eq!(
+        dense.budget.get_mem_bytes_consumed().unwrap(),
+        apply.budget.get_mem_bytes_consumed().unwrap()
+    );
+    assert_eq!(
+        dense.result.ledger_changes.len(),
+        apply.result.ledger_changes.len()
+    );
+
+    let mut saw_cached_ttl_entry = false;
+    for (dense_change, apply_change) in dense
+        .result
+        .ledger_changes
+        .iter()
+        .zip(apply.result.ledger_changes.iter())
+    {
+        assert!(!dense_change.encoded_key.is_empty());
+        assert!(apply_change.encoded_key.is_empty());
+        assert_eq!(dense_change.read_only, apply_change.read_only);
+        assert_eq!(
+            dense_change.old_entry_size_bytes_for_rent,
+            apply_change.old_entry_size_bytes_for_rent
+        );
+        assert_eq!(
+            dense_change.new_entry_size_bytes_for_rent,
+            apply_change.new_entry_size_bytes_for_rent
+        );
+        assert_eq!(
+            dense_change.encoded_new_value,
+            apply_change.encoded_new_value
+        );
+        assert_eq!(dense_change.ttl_change, apply_change.ttl_change);
+
+        if dense_change
+            .ttl_change
+            .as_ref()
+            .map(|ttl| ttl.old_live_until_ledger == ledger_info.sequence_number + 1000)
+            .unwrap_or(false)
+        {
+            saw_cached_ttl_entry = true;
+        }
+    }
+    assert!(saw_cached_ttl_entry);
 }
 
 #[test]

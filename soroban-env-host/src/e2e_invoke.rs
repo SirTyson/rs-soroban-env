@@ -254,23 +254,15 @@ fn get_ledger_changes(
             .and_then(|metadata| metadata.get(pos))
             .and_then(Option::as_ref);
 
-        // Decide whether the encoded LedgerKey bytes are actually needed:
-        // - If the public `encoded_key` field is consumed downstream (recording
-        //   mode / simulation) we always serialize into it.
-        // - Otherwise we only need the bytes as scratch for sha256 hashing
-        //   when no cached TTL key_hash is available.
-        let need_key_hash_fallback = durability.is_some()
-            && initial_metadata
-                .and_then(|metadata| metadata.ttl_entry.as_ref())
-                .is_none();
-        let need_encoded_key = populate_encoded_key || need_key_hash_fallback;
-        if need_encoded_key {
-            if populate_encoded_key {
-                metered_write_xdr(budget, key.as_ref(), &mut entry_change.encoded_key)?;
-            } else {
-                scratch_key_buf.clear();
-                metered_write_xdr(budget, key.as_ref(), &mut scratch_key_buf)?;
-            }
+        // Keep budget accounting identical to the dense path by performing the
+        // metered key serialization for every footprint entry. The apply path
+        // writes into a reused scratch buffer instead of retaining the bytes in
+        // each LedgerEntryChange.
+        if populate_encoded_key {
+            metered_write_xdr(budget, key.as_ref(), &mut entry_change.encoded_key)?;
+        } else {
+            scratch_key_buf.clear();
+            metered_write_xdr(budget, key.as_ref(), &mut scratch_key_buf)?;
         }
 
         if let Some(durability) = durability {
@@ -535,8 +527,8 @@ pub fn invoke_host_function<T: AsRef<[u8]>, I: ExactSizeIterator<Item = T>>(
 /// bytes in the returned `LedgerEntryChange`s. Use this when the caller
 /// does not consume `encoded_key` (e.g. the stellar-core bridge apply
 /// path, which extracts only `read_only`, `encoded_new_value`, and
-/// `ttl_change`). Avoids one metered `LedgerKey` XDR serialization per
-/// footprint entry that already has cached TTL metadata.
+/// `ttl_change`). Budget accounting is preserved by still performing the
+/// metered key serialization into a reused scratch buffer.
 #[allow(clippy::too_many_arguments)]
 pub fn invoke_host_function_for_apply<T: AsRef<[u8]>, I: ExactSizeIterator<Item = T>>(
     budget: &Budget,
