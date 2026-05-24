@@ -58,7 +58,6 @@ enum SoroswapPoolGetter {
 
 // Soroswap pair pool error codes, matching the SoroswapPairError enum embedded
 // in the vendored apply-load pool Wasm (see contract spec custom section).
-const SOROSWAP_ERR_NOT_INITIALIZED: u32 = 102;
 const SOROSWAP_ERR_SWAP_INSUFFICIENT_OUTPUT_AMOUNT: u32 = 108;
 const SOROSWAP_ERR_SWAP_NEGATIVES_OUT_NOT_SUPPORTED: u32 = 109;
 const SOROSWAP_ERR_SWAP_INSUFFICIENT_LIQUIDITY: u32 = 110;
@@ -794,25 +793,23 @@ impl Host {
         let args_vec = args.to_vec();
         match &instance.executable {
             ContractExecutable::Wasm(wasm_hash) => {
-                if let Some(rv) = self.try_call_native_soroswap_pool_getter(
-                    id,
-                    func,
-                    args,
-                    args_vec.clone(),
-                    &instance,
-                    wasm_hash,
-                )? {
-                    return Ok(rv);
+                if let Some(getter) =
+                    self.match_native_soroswap_pool_getter(func, args, &instance, wasm_hash)?
+                {
+                    let frame =
+                        Frame::NativeContract(id.metered_clone(self)?, *func, args_vec, instance);
+                    return self.with_frame(frame, || {
+                        self.call_native_soroswap_pool_getter(getter)
+                    });
                 }
-                if let Some(rv) = self.try_call_native_soroswap_pool_swap(
-                    id,
-                    func,
-                    args,
-                    args_vec.clone(),
-                    &instance,
-                    wasm_hash,
-                )? {
-                    return Ok(rv);
+                if let Some((amount_0_out, amount_1_out, to_addr)) =
+                    self.match_native_soroswap_pool_swap(func, args, &instance, wasm_hash)?
+                {
+                    let frame =
+                        Frame::NativeContract(id.metered_clone(self)?, *func, args_vec, instance);
+                    return self.with_frame(frame, || {
+                        self.call_native_soroswap_pool_swap(amount_0_out, amount_1_out, to_addr)
+                    });
                 }
                 let vm = self.instantiate_vm(id, wasm_hash)?;
                 let relative_objects = Vec::new();
@@ -837,15 +834,13 @@ impl Host {
         }
     }
 
-    fn try_call_native_soroswap_pool_getter(
+    fn match_native_soroswap_pool_getter(
         &self,
-        id: &ContractId,
         func: &Symbol,
         args: &[Val],
-        args_vec: Vec<Val>,
         instance: &ScContractInstance,
         wasm_hash: &Hash,
-    ) -> Result<Option<Val>, HostError> {
+    ) -> Result<Option<SoroswapPoolGetter>, HostError> {
         // Next-protocol gate: this native emulation bypasses Wasm instantiation
         // and changes protocol-visible budget/dispatch accounting, so it must
         // not run for the released protocol version. Keep p26 execution exact.
@@ -861,14 +856,7 @@ impl Host {
         if !Self::soroswap_pool_instance_matches_getter(instance, getter) {
             return Ok(None);
         }
-        let frame = Frame::NativeContract(
-            id.metered_clone(self)?,
-            *func,
-            args_vec,
-            instance.metered_clone(self)?,
-        );
-        self.with_frame(frame, || self.call_native_soroswap_pool_getter(getter))
-            .map(Some)
+        Ok(Some(getter))
     }
 
     fn soroswap_pool_getter_for_symbol(
@@ -992,6 +980,9 @@ impl Host {
     }
 
     fn soroswap_pool_get_address(&self, key: u32) -> Result<Val, HostError> {
+        if let Some(address) = self.soroswap_pool_native_address(key)? {
+            return Ok(address.to_val());
+        }
         let val = self.soroswap_pool_get_required_val(key)?;
         AddressObject::try_from(val).map_err(|_| {
             self.err(
@@ -1002,6 +993,50 @@ impl Host {
             )
         })?;
         Ok(val)
+    }
+
+    fn soroswap_pool_native_address(&self, key: u32) -> Result<Option<AddressObject>, HostError> {
+        match self.soroswap_pool_native_scaddress(key)? {
+            Some(addr) => Ok(Some(self.add_host_object(addr)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn soroswap_pool_native_scaddress(&self, key: u32) -> Result<Option<ScAddress>, HostError> {
+        self.with_current_context_mut(|ctx| {
+            let Frame::NativeContract(_, _, _, instance) = &ctx.frame else {
+                return Ok(None);
+            };
+            let Some(storage) = instance.storage.as_ref() else {
+                return Ok(None);
+            };
+            match Self::soroswap_pool_scmap_get(storage, key) {
+                Some(ScVal::Address(addr)) => match addr {
+                    ScAddress::Account(_) | ScAddress::Contract(_) => {
+                        Ok(Some(addr.metered_clone(self)?))
+                    }
+                    _ => Ok(None),
+                },
+                _ => Ok(None),
+            }
+        })
+    }
+
+    fn soroswap_pool_required_native_scaddress(
+        &self,
+        key: u32,
+    ) -> Result<ScAddress, HostError> {
+        self.soroswap_pool_native_scaddress(key)?.ok_or_else(|| {
+            self.err(
+                ScErrorType::Storage,
+                ScErrorCode::MissingValue,
+                "missing Soroswap pool address instance storage key",
+                &[
+                    Val::from_u32(key).to_val(),
+                    Val::from_u32(StorageType::Instance as u32).to_val(),
+                ],
+            )
+        })
     }
 
     fn soroswap_pool_get_i128_val(&self, key: u32) -> Result<Val, HostError> {
@@ -1089,15 +1124,13 @@ impl Host {
         })
     }
 
-    fn try_call_native_soroswap_pool_swap(
+    fn match_native_soroswap_pool_swap(
         &self,
-        id: &ContractId,
         func: &Symbol,
         args: &[Val],
-        args_vec: Vec<Val>,
         instance: &ScContractInstance,
         wasm_hash: &Hash,
-    ) -> Result<Option<Val>, HostError> {
+    ) -> Result<Option<(i128, i128, AddressObject)>, HostError> {
         // Next-protocol gate: this native emulation bypasses Wasm instantiation
         // and changes protocol-visible budget/dispatch accounting, so it must
         // not run for the released protocol version. Keep p26 execution exact.
@@ -1139,17 +1172,7 @@ impl Host {
         {
             return Ok(None);
         }
-
-        let frame = Frame::NativeContract(
-            id.metered_clone(self)?,
-            *func,
-            args_vec,
-            instance.metered_clone(self)?,
-        );
-        self.with_frame(frame, || {
-            self.call_native_soroswap_pool_swap(amount_0_out, amount_1_out, to_addr)
-        })
-        .map(Some)
+        Ok(Some((amount_0_out, amount_1_out, to_addr)))
     }
 
     fn call_native_soroswap_pool_swap(
@@ -1170,14 +1193,6 @@ impl Host {
             SOROSWAP_POOL_TTL_THRESHOLD,
             SOROSWAP_POOL_TTL_EXTEND_TO,
         )?;
-
-        // NotInitialized check: pool wasm checks `has_token_0`.
-        if self
-            .soroswap_pool_instance_storage_get(0)?
-            .is_none()
-        {
-            return Err(self.soroswap_pool_contract_err(SOROSWAP_ERR_NOT_INITIALIZED));
-        }
 
         // Output amount validation, matching the wasm order:
         //   both zero       -> SwapInsufficientOutputAmount (108)
@@ -1203,30 +1218,14 @@ impl Host {
             ));
         }
 
-        let token_0_val = self.soroswap_pool_get_required_val(0)?;
-        let token_1_val = self.soroswap_pool_get_required_val(1)?;
-        let token_0 = AddressObject::try_from(token_0_val).map_err(|_| {
-            self.err(
-                ScErrorType::Object,
-                ScErrorCode::UnexpectedType,
-                "soroswap token_0 storage value is not an Address",
-                &[token_0_val],
-            )
-        })?;
-        let token_1 = AddressObject::try_from(token_1_val).map_err(|_| {
-            self.err(
-                ScErrorType::Object,
-                ScErrorCode::UnexpectedType,
-                "soroswap token_1 storage value is not an Address",
-                &[token_1_val],
-            )
-        })?;
-
-        if self.soroswap_pool_address_eq(to, token_0)?
-            || self.soroswap_pool_address_eq(to, token_1)?
-        {
+        let token_0_addr = self.soroswap_pool_required_native_scaddress(0)?;
+        let token_1_addr = self.soroswap_pool_required_native_scaddress(1)?;
+        let to_addr = self.scaddress_from_address(to)?;
+        if to_addr == token_0_addr || to_addr == token_1_addr {
             return Err(self.soroswap_pool_contract_err(SOROSWAP_ERR_SWAP_INVALID_TO));
         }
+        let token_0 = self.add_host_object(token_0_addr)?;
+        let token_1 = self.add_host_object(token_1_addr)?;
 
         let pair_address = self.add_host_object(ScAddress::Contract(
             contract_id.metered_clone(self)?,
@@ -1461,21 +1460,6 @@ impl Host {
             "soroswap pool native swap returned contract error",
             &[Val::from_u32(code).to_val()],
         )
-    }
-
-    fn soroswap_pool_address_eq(
-        &self,
-        a: AddressObject,
-        b: AddressObject,
-    ) -> Result<bool, HostError> {
-        let mut vmcaller = crate::VmCaller::none();
-        let cmp = <Host as crate::VmCallerEnv>::obj_cmp(
-            self,
-            &mut vmcaller,
-            a.to_val(),
-            b.to_val(),
-        )?;
-        Ok(cmp == 0)
     }
 
     fn soroswap_pool_invoke_sac_transfer(
