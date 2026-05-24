@@ -11,9 +11,9 @@ use crate::{
     },
     storage::{InstanceStorageMap, StorageMap},
     xdr::{
-        ContractExecutable, ContractId, ContractIdPreimage, CreateContractArgsV2, Hash,
-        HostFunction, HostFunctionType, ScAddress, ScContractInstance, ScErrorCode, ScErrorType,
-        ScMap, ScVal,
+        int128_helpers, ContractExecutable, ContractId, ContractIdPreimage, CreateContractArgsV2,
+        Hash, HostFunction, HostFunctionType, Int128Parts, ScAddress, ScContractInstance,
+        ScErrorCode, ScErrorType, ScMap, ScMapEntry, ScVal,
     },
     AddressObject, EnvBase, Error, ErrorHandler, Host, HostError, Object, StorageType, Symbol,
     SymbolStr, TryFromVal, TryIntoVal, Val, Vm, DEFAULT_HOST_DEPTH_LIMIT,
@@ -967,8 +967,28 @@ impl Host {
     }
 
     fn soroswap_pool_instance_storage_get(&self, key: u32) -> Result<Option<Val>, HostError> {
+        if let Some(val) = self.soroswap_pool_native_instance_storage_get(key)? {
+            return Ok(val);
+        }
         let key = Val::from_u32(key).to_val();
         self.with_instance_storage(|s| Ok(s.map.get(&key, self)?.copied()))
+    }
+
+    fn soroswap_pool_native_instance_storage_get(
+        &self,
+        key: u32,
+    ) -> Result<Option<Option<Val>>, HostError> {
+        self.with_current_context_mut(|ctx| {
+            let Frame::NativeContract(_, _, _, instance) = &ctx.frame else {
+                return Ok(None);
+            };
+            let Some(storage) = instance.storage.as_ref() else {
+                return Ok(Some(None));
+            };
+            Self::soroswap_pool_scmap_get(storage, key).map_or(Ok(Some(None)), |v| {
+                self.to_valid_host_val(v).map(|v| Some(Some(v)))
+            })
+        })
     }
 
     fn soroswap_pool_get_address(&self, key: u32) -> Result<Val, HostError> {
@@ -1005,7 +1025,10 @@ impl Host {
                 ScErrorType::Storage,
                 ScErrorCode::MissingValue,
                 "missing Soroswap pool instance storage key",
-                &[Val::from_u32(key).to_val(), Val::from_u32(StorageType::Instance as u32).to_val()],
+                &[
+                    Val::from_u32(key).to_val(),
+                    Val::from_u32(StorageType::Instance as u32).to_val(),
+                ],
             )
         })
     }
@@ -1255,15 +1278,7 @@ impl Host {
         }
 
         // Update reserves (instance storage keys 2 and 3) with the new balances.
-        let new_reserve_0_val: Val = balance_0.try_into_val(self)?;
-        let new_reserve_1_val: Val = balance_1.try_into_val(self)?;
-        self.with_mut_instance_storage(|s| {
-            let k0 = Val::from_u32(2).to_val();
-            let k1 = Val::from_u32(3).to_val();
-            s.map = s.map.insert(k0, new_reserve_0_val, self)?;
-            s.map = s.map.insert(k1, new_reserve_1_val, self)?;
-            Ok(())
-        })?;
+        self.soroswap_pool_update_reserves(balance_0, balance_1)?;
 
         // Emit the SwapEvent equivalent. Topics are
         // [Symbol("SoroswapPair"), Symbol("swap")] and data is an ScMap with
@@ -1291,10 +1306,13 @@ impl Host {
             amount_1_out_val,
             to.to_val(),
         ];
-        let data = self.map_new_from_slices(&keys.map(|k| {
-            // SAFETY: all keys are valid soroban symbol characters and <=32 chars.
-            core::str::from_utf8(k).unwrap_or("")
-        }), &vals)?;
+        let data = self.map_new_from_slices(
+            &keys.map(|k| {
+                // SAFETY: all keys are valid soroban symbol characters and <=32 chars.
+                core::str::from_utf8(k).unwrap_or("")
+            }),
+            &vals,
+        )?;
         self.record_contract_event(
             crate::xdr::ContractEventType::Contract,
             topics,
@@ -1302,6 +1320,85 @@ impl Host {
         )?;
 
         Ok(Val::VOID.to_val())
+    }
+
+    fn soroswap_pool_update_reserves(
+        &self,
+        reserve_0: i128,
+        reserve_1: i128,
+    ) -> Result<(), HostError> {
+        if self.with_current_context_mut(|ctx| {
+            let Frame::NativeContract(_, _, _, instance) = &mut ctx.frame else {
+                return Ok(false);
+            };
+            let Some(storage) = instance.storage.as_ref() else {
+                return Err(self.err(
+                    ScErrorType::Storage,
+                    ScErrorCode::MissingValue,
+                    "missing Soroswap pool instance storage during native reserve update",
+                    &[],
+                ));
+            };
+            instance.storage = Some(self.soroswap_pool_reserves_updated_scmap(
+                storage, reserve_0, reserve_1,
+            )?);
+            Ok(true)
+        })? {
+            return Ok(());
+        }
+
+        let new_reserve_0_val: Val = reserve_0.try_into_val(self)?;
+        let new_reserve_1_val: Val = reserve_1.try_into_val(self)?;
+        self.with_mut_instance_storage(|s| {
+            let k0 = Val::from_u32(2).to_val();
+            let k1 = Val::from_u32(3).to_val();
+            s.map = s.map.insert(k0, new_reserve_0_val, self)?;
+            s.map = s.map.insert(k1, new_reserve_1_val, self)?;
+            Ok(())
+        })
+    }
+
+    fn soroswap_pool_reserves_updated_scmap(
+        &self,
+        storage: &ScMap,
+        reserve_0: i128,
+        reserve_1: i128,
+    ) -> Result<ScMap, HostError> {
+        let mut found_reserve_0 = false;
+        let mut found_reserve_1 = false;
+        let mut entries = Vec::<ScMapEntry>::with_metered_capacity(storage.len(), self)?;
+        for entry in storage.iter() {
+            let mut updated = entry.metered_clone(self)?;
+            match &entry.key {
+                ScVal::U32(2) => {
+                    updated.val = Self::soroswap_pool_i128_scval(reserve_0);
+                    found_reserve_0 = true;
+                }
+                ScVal::U32(3) => {
+                    updated.val = Self::soroswap_pool_i128_scval(reserve_1);
+                    found_reserve_1 = true;
+                }
+                _ => {}
+            }
+            entries.push(updated);
+        }
+
+        if !found_reserve_0 || !found_reserve_1 {
+            return Err(self.err(
+                ScErrorType::Storage,
+                ScErrorCode::MissingValue,
+                "missing Soroswap pool reserve storage key during native reserve update",
+                &[],
+            ));
+        }
+        Ok(ScMap(self.map_err(entries.try_into())?))
+    }
+
+    fn soroswap_pool_i128_scval(value: i128) -> ScVal {
+        ScVal::I128(Int128Parts {
+            hi: int128_helpers::i128_hi(value),
+            lo: int128_helpers::i128_lo(value),
+        })
     }
 
     fn soroswap_pool_contract_err(&self, code: u32) -> HostError {
@@ -1865,6 +1962,11 @@ impl Host {
     // when there are no changes to persist).
     fn persist_instance_storage(&self) -> Result<bool, HostError> {
         let updated_instance_storage = self.with_current_context_mut(|ctx| {
+            if let Frame::NativeContract(_, func, _, instance) = &ctx.frame {
+                if self.symbol_matches(b"swap", *func)? {
+                    return instance.storage.metered_clone(self);
+                }
+            }
             if let Some(storage) = &ctx.storage {
                 if !storage.is_modified {
                     return Ok(None);
