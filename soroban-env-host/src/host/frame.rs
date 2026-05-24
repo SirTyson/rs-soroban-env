@@ -1005,18 +1005,74 @@ impl Host {
     }
 
     fn soroswap_pool_get_i128_val(&self, key: u32) -> Result<Val, HostError> {
+        if let Some(v) = self.soroswap_pool_native_i128(key)? {
+            return self.soroswap_pool_i128_to_val(v);
+        }
         let val = self.soroswap_pool_get_required_val(key)?;
         let _: i128 = i128::try_from_val(self, &val)?;
         Ok(val)
     }
 
     fn soroswap_pool_get_optional_i128_val(&self, key: u32) -> Result<Option<Val>, HostError> {
+        if self.soroswap_pool_on_native_frame()? {
+            return match self.soroswap_pool_native_i128(key)? {
+                Some(v) => Ok(Some(self.soroswap_pool_i128_to_val(v)?)),
+                None => Ok(None),
+            };
+        }
         if let Some(val) = self.soroswap_pool_instance_storage_get(key)? {
             let _: i128 = i128::try_from_val(self, &val)?;
             Ok(Some(val))
         } else {
             Ok(None)
         }
+    }
+
+    // Returns `Some(i128)` when called from a native Soroswap pool frame whose
+    // raw `ScContractInstance.storage` contains an `ScVal::I128` at `key`,
+    // bypassing host-object materialization. Returns `Ok(None)` if the caller
+    // is not on a native frame OR if the key is missing / mistyped, leaving the
+    // caller to fall back to the generic path or surface a missing-value
+    // error as appropriate.
+    fn soroswap_pool_native_i128(&self, key: u32) -> Result<Option<i128>, HostError> {
+        self.with_current_context_mut(|ctx| {
+            let Frame::NativeContract(_, _, _, instance) = &ctx.frame else {
+                return Ok(None);
+            };
+            let Some(storage) = instance.storage.as_ref() else {
+                return Ok(None);
+            };
+            Ok(match Self::soroswap_pool_scmap_get(storage, key) {
+                Some(ScVal::I128(parts)) => {
+                    Some(int128_helpers::i128_from_pieces(parts.hi, parts.lo))
+                }
+                _ => None,
+            })
+        })
+    }
+
+    fn soroswap_pool_required_native_i128(&self, key: u32) -> Result<i128, HostError> {
+        self.soroswap_pool_native_i128(key)?.ok_or_else(|| {
+            self.err(
+                ScErrorType::Storage,
+                ScErrorCode::MissingValue,
+                "missing Soroswap pool i128 instance storage key",
+                &[
+                    Val::from_u32(key).to_val(),
+                    Val::from_u32(StorageType::Instance as u32).to_val(),
+                ],
+            )
+        })
+    }
+
+    fn soroswap_pool_on_native_frame(&self) -> Result<bool, HostError> {
+        self.with_current_context_mut(|ctx| {
+            Ok(matches!(&ctx.frame, Frame::NativeContract(_, _, _, _)))
+        })
+    }
+
+    fn soroswap_pool_i128_to_val(&self, value: i128) -> Result<Val, HostError> {
+        Ok(self.add_host_object(value)?.to_val())
     }
 
     fn soroswap_pool_get_required_val(&self, key: u32) -> Result<Val, HostError> {
@@ -1138,10 +1194,8 @@ impl Host {
             ));
         }
 
-        let reserve_0_val = self.soroswap_pool_get_required_val(2)?;
-        let reserve_1_val = self.soroswap_pool_get_required_val(3)?;
-        let reserve_0: i128 = i128::try_from_val(self, &reserve_0_val)?;
-        let reserve_1: i128 = i128::try_from_val(self, &reserve_1_val)?;
+        let reserve_0 = self.soroswap_pool_required_native_i128(2)?;
+        let reserve_1 = self.soroswap_pool_required_native_i128(3)?;
 
         if amount_0_out >= reserve_0 || amount_1_out >= reserve_1 {
             return Err(self.soroswap_pool_contract_err(
