@@ -177,6 +177,132 @@ fn extend_contract_balance_ttl(e: &Host, key: Rc<LedgerKey>) -> Result<(), HostE
     )
 }
 
+/// Re-export of `extend_contract_balance_ttl` for the explicit-token fused
+/// transfer fast path. Kept as a thin wrapper rather than making the original
+/// function `pub(crate)` so the SAC module continues to own this side-effect
+/// surface.
+pub(crate) fn extend_contract_balance_ttl_pub(
+    e: &Host,
+    key: Rc<LedgerKey>,
+) -> Result<(), HostError> {
+    extend_contract_balance_ttl(e, key)
+}
+
+/// Output of `read_contract_balance_entry_for_token`. Bundles the loaded
+/// balance with the ledger key and current `live_until_ledger` so the
+/// matching write helper can preserve the existing TTL.
+pub(crate) struct BalanceFetched {
+    pub balance: BalanceValue,
+    pub key: Rc<LedgerKey>,
+    pub live_until_ledger: Option<u32>,
+}
+
+/// Reads the `Balance(owner_contract_id)` entry from the SAC token's persistent
+/// storage using an explicit token contract id (rather than the current
+/// frame's contract id). Returns `Ok(Some(...))` if the entry exists and
+/// parses as a valid `BalanceValue`, `Ok(None)` if the entry is absent. Any
+/// malformed entry surfaces as an error (matching `read_contract_balance`).
+///
+/// Used by the explicit-token-id transfer fast path in `direct_transfer.rs`
+/// which must operate on the token's storage scope without pushing a SAC
+/// frame.
+pub(crate) fn read_contract_balance_entry_for_token(
+    e: &Host,
+    sac_contract_id: &ContractId,
+    owner_contract_id: &ContractId,
+) -> Result<Option<BalanceFetched>, HostError> {
+    let key_scval = contract_balance_key_scval(
+        e,
+        ScAddress::Contract(owner_contract_id.metered_clone(e)?),
+    )?;
+    let key = e.storage_key_for_address(
+        ScAddress::Contract(sac_contract_id.metered_clone(e)?),
+        key_scval,
+        ContractDataDurability::Persistent,
+    )?;
+    let current = {
+        let mut storage = e.try_borrow_storage_mut()?;
+        storage.try_get_full(&key, e, None)?
+    };
+    match current {
+        Some((entry, live_until_ledger)) => match &entry.data {
+            LedgerEntryData::ContractData(data) => {
+                let balance = balance_value_from_scval(e, &data.val)?;
+                Ok(Some(BalanceFetched {
+                    balance,
+                    key,
+                    live_until_ledger,
+                }))
+            }
+            _ => Err(e.err(
+                ScErrorType::Storage,
+                ScErrorCode::InternalError,
+                "expected contract data ledger entry",
+                &[],
+            )),
+        },
+        None => Ok(None),
+    }
+}
+
+/// Writes a `BalanceValue` back to the SAC token's persistent storage using an
+/// explicit token contract id. The entry must already exist (`live_until` is
+/// the TTL extracted by the matching `read_contract_balance_entry_for_token`
+/// call); this helper does not create new balance entries. TTL extension is
+/// performed separately by the caller (matching the layout in
+/// `write_contract_balance`, where `extend_contract_balance_ttl` is called
+/// after `put`).
+pub(crate) fn write_contract_balance_entry_for_token(
+    e: &Host,
+    sac_contract_id: &ContractId,
+    _owner_contract_id: &ContractId,
+    key: &Rc<LedgerKey>,
+    live_until_ledger: Option<u32>,
+    balance: &BalanceValue,
+) -> Result<(), HostError> {
+    // Loaded entry's `LedgerEntry` is not retained by
+    // `read_contract_balance_entry_for_token` so we have to re-fetch the full
+    // entry here to preserve any non-`val` fields that `try_get` discarded.
+    // This matches `write_contract_balance`, which also does a fresh
+    // `try_get_full` before mutating + putting.
+    let val = balance_value_scval(e, balance)?;
+    let _ = sac_contract_id; // witness — caller asserts this matches `key`
+    let current_entry = {
+        let mut storage = e.try_borrow_storage_mut()?;
+        storage.try_get_full(key, e, None)?
+    };
+    let Some((current, _)) = current_entry else {
+        return Err(e.err(
+            ScErrorType::Storage,
+            ScErrorCode::MissingValue,
+            "balance entry missing on explicit-token write back",
+            &[],
+        ));
+    };
+    let mut current = (*current).metered_clone(e)?;
+    match current.data {
+        LedgerEntryData::ContractData(ref mut entry) => {
+            entry.val = val;
+        }
+        _ => {
+            return Err(e.err(
+                ScErrorType::Storage,
+                ScErrorCode::InternalError,
+                "expected DataEntry",
+                &[],
+            ));
+        }
+    }
+    e.try_borrow_storage_mut()?.put(
+        key,
+        &Rc::metered_new(current, e)?,
+        live_until_ledger,
+        e,
+        None,
+    )?;
+    Ok(())
+}
+
 pub(crate) fn read_contract_balance_for_contract_owner(
     e: &Host,
     sac_contract_id: &ContractId,

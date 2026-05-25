@@ -261,4 +261,32 @@ impl Host {
         };
         self.with_events_mut(|events| Ok(events.record(InternalEvent::Contract(ce), self)))?
     }
+
+    /// Records a `Contract` contract-event but tags it with an explicit
+    /// contract id (rather than the current frame's contract id). Used by
+    /// fused fast paths that emit a SAC-token event without pushing a SAC
+    /// frame (e.g. the native Soroswap pair direct-transfer path emits the
+    /// SAC `transfer` event under the token's contract id while running
+    /// inside the pair's `Frame::NativeContract`).
+    pub(crate) fn record_contract_event_for_contract_id(
+        &self,
+        contract_id: &crate::xdr::ContractId,
+        topics: VecObject,
+        data: Val,
+    ) -> Result<(), HostError> {
+        use crate::host::metered_clone::MeteredClone;
+        use crate::xdr::ScBytes;
+        let id_bytes = ScBytes(
+            self.metered_slice_to_vec(contract_id.0.as_slice())?
+                .try_into()?,
+        );
+        let id_obj = self.add_host_object::<ScBytes>(id_bytes)?;
+        let ce = InternalContractEvent {
+            type_: ContractEventType::Contract,
+            contract_id: Some(id_obj),
+            topics,
+            data,
+        };
+        self.with_events_mut(|events| Ok(events.record(InternalEvent::Contract(ce), self)))?
+    }
 }

@@ -159,6 +159,75 @@ impl Host {
         }
     }
 
+    /// Peeks at a SAC-token contract instance ledger entry and, if the
+    /// executable is `ContractExecutable::StellarAsset` and the `METADATA`
+    /// instance-storage entry is present with a valid `name` field, returns a
+    /// cloned `ScString` containing the asset name. Returns `Ok(None)` for any
+    /// other shape (non-SAC executable, missing METADATA entry, malformed
+    /// metadata layout) so the caller can cleanly fall back to the regular
+    /// SAC dispatch path. Errors only on actual storage / metering failures.
+    ///
+    /// Used by the fused direct-SAC-transfer fast path
+    /// (`try_direct_contract_to_contract_transfer`) which needs the asset
+    /// name to emit the SAC `transfer` event topic without pushing a SAC
+    /// frame to call `read_name`.
+    pub(crate) fn peek_stellar_asset_metadata_name_from_instance(
+        &self,
+        key: &Rc<LedgerKey>,
+    ) -> Result<Option<crate::xdr::ScString>, HostError> {
+        let entry = self.try_borrow_storage_mut()?.get(key, self, None)?;
+        let instance = match &entry.data {
+            LedgerEntryData::ContractData(e) => match &e.val {
+                ScVal::ContractInstance(instance) => instance,
+                _ => {
+                    return Err(self.err(
+                        ScErrorType::Storage,
+                        ScErrorCode::InternalError,
+                        "ledger entry for contract instance does not contain contract instance",
+                        &[],
+                    ))
+                }
+            },
+            _ => {
+                return Err(self.err(
+                    ScErrorType::Storage,
+                    ScErrorCode::InternalError,
+                    "expected ContractData ledger entry",
+                    &[],
+                ))
+            }
+        };
+        if !matches!(instance.executable, ContractExecutable::StellarAsset) {
+            return Ok(None);
+        }
+        let Some(storage_map) = &instance.storage else {
+            return Ok(None);
+        };
+        // The METADATA key is `ScVal::Symbol("METADATA")` (a SymbolSmall in
+        // wire form). Locate it in the instance storage map.
+        let metadata_val = storage_map.iter().find_map(|entry| match &entry.key {
+            ScVal::Symbol(sym) if sym.0.as_slice() == b"METADATA" => Some(&entry.val),
+            _ => None,
+        });
+        let Some(metadata_val) = metadata_val else {
+            return Ok(None);
+        };
+        // The metadata struct serializes to `ScVal::Map([{decimal,U32},
+        // {name,String},{symbol,String}])` (alphabetical, per the
+        // `contracttype` derive). Locate the `name` field by symbol key.
+        let ScVal::Map(Some(fields)) = metadata_val else {
+            return Ok(None);
+        };
+        let name_val = fields.iter().find_map(|entry| match &entry.key {
+            ScVal::Symbol(sym) if sym.0.as_slice() == b"name" => Some(&entry.val),
+            _ => None,
+        });
+        let Some(ScVal::String(name)) = name_val else {
+            return Ok(None);
+        };
+        Ok(Some(name.metered_clone(self)?))
+    }
+
     pub(crate) fn contract_code_ledger_key(
         &self,
         wasm_hash: &Hash,

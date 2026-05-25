@@ -1,7 +1,8 @@
 use crate::{
     auth::AuthorizationManagerSnapshot,
     builtin_contracts::stellar_asset_contract::{
-        read_contract_balance_for_contract_owner, INSTANCE_EXTEND_AMOUNT, INSTANCE_TTL_THRESHOLD,
+        read_contract_balance_for_contract_owner, try_direct_contract_to_contract_transfer,
+        DirectTransferOutcome, INSTANCE_EXTEND_AMOUNT, INSTANCE_TTL_THRESHOLD,
     },
     budget::AsBudget,
     err,
@@ -1231,25 +1232,40 @@ impl Host {
             contract_id.metered_clone(self)?,
         ))?;
 
+        let mut balance_0_opt: Option<i128> = None;
+        let mut balance_1_opt: Option<i128> = None;
         if amount_0_out > 0 {
-            self.soroswap_pool_invoke_sac_transfer(
+            balance_0_opt = self.soroswap_pool_transfer_and_balance_or_fallback(
                 token_0,
                 pair_address,
                 to,
                 amount_0_out,
+                &contract_id,
             )?;
         }
         if amount_1_out > 0 {
-            self.soroswap_pool_invoke_sac_transfer(
+            balance_1_opt = self.soroswap_pool_transfer_and_balance_or_fallback(
                 token_1,
                 pair_address,
                 to,
                 amount_1_out,
+                &contract_id,
             )?;
         }
 
-        let balance_0 = self.soroswap_pool_invoke_sac_balance(token_0, pair_address)?;
-        let balance_1 = self.soroswap_pool_invoke_sac_balance(token_1, pair_address)?;
+        // For the side that was either skipped (amount == 0) or fell back to
+        // the nested SAC transfer subcall, we still need to read the
+        // post-transfer balance via the direct SAC-balance helper. The fused
+        // helper already returns the authoritative post-transfer balance for
+        // sides it handled.
+        let balance_0 = match balance_0_opt {
+            Some(b) => b,
+            None => self.soroswap_pool_invoke_sac_balance(token_0, pair_address)?,
+        };
+        let balance_1 = match balance_1_opt {
+            Some(b) => b,
+            None => self.soroswap_pool_invoke_sac_balance(token_1, pair_address)?,
+        };
 
         let amount_0_in = match reserve_0.checked_sub(amount_0_out) {
             Some(r) if balance_0 > r => balance_0.checked_sub(r).ok_or_else(|| {
@@ -1479,6 +1495,54 @@ impl Host {
             CallParams::default_external_call(),
         )?;
         Ok(())
+    }
+
+    /// Fused output-token transfer + post-transfer balance read for the
+    /// native Soroswap pair `swap` fast path. Attempts to perform a
+    /// contract→contract SAC `transfer` directly against the explicit token
+    /// without pushing a `Frame::StellarAssetContract` (and the associated
+    /// auth/dispatch overhead). On success, returns
+    /// `Ok(Some(post_transfer_from_balance))` so the caller can skip the
+    /// subsequent `balance(from)` read for this token. If any precondition
+    /// is unmet (non-SAC token, account or muxed-account recipient, missing
+    /// or deauthorized or insufficient balance, malformed METADATA, etc.)
+    /// the helper falls back to the regular nested SAC `transfer` subcall
+    /// and returns `Ok(None)` so the caller invokes the regular SAC
+    /// `balance(from)` read.
+    ///
+    /// `from_pair_id` must equal the current pair contract id — the caller
+    /// passes the already-resolved id rather than re-deriving it from
+    /// `from`. The fused path's auth elision is only safe when `from` is the
+    /// current contract (direct-invoker rule succeeds without consuming a
+    /// tracker entry).
+    fn soroswap_pool_transfer_and_balance_or_fallback(
+        &self,
+        token: AddressObject,
+        from: AddressObject,
+        to: AddressObject,
+        amount: i128,
+        from_pair_id: &ContractId,
+    ) -> Result<Option<i128>, HostError> {
+        if amount > 0 {
+            let token_id = self.contract_id_from_address(token)?;
+            let to_sc = self.scaddress_from_address(to)?;
+            if let ScAddress::Contract(to_id) = to_sc {
+                let outcome = try_direct_contract_to_contract_transfer(
+                    self,
+                    &token_id,
+                    from_pair_id,
+                    &to_id,
+                    from,
+                    to,
+                    amount,
+                )?;
+                if let DirectTransferOutcome::Applied(new_from_balance) = outcome {
+                    return Ok(Some(new_from_balance));
+                }
+            }
+        }
+        self.soroswap_pool_invoke_sac_transfer(token, from, to, amount)?;
+        Ok(None)
     }
 
     fn soroswap_pool_invoke_sac_balance(
