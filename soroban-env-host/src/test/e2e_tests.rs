@@ -1303,19 +1303,48 @@ fn test_apply_invoke_preserves_budget_while_omitting_encoded_keys() {
         dense.budget.get_mem_bytes_consumed().unwrap(),
         apply.budget.get_mem_bytes_consumed().unwrap()
     );
-    assert_eq!(
-        dense.result.ledger_changes.len(),
-        apply.result.ledger_changes.len()
-    );
+    // The apply path filters out entries that contribute nothing to the
+    // bridge-output (i.e. read-only entries with no TTL extension and no
+    // modified value). The dense path always emits one entry per footprint
+    // key, so the apply path must be a (possibly proper) subset of the dense
+    // path, but the relative order is preserved.
+    assert!(apply.result.ledger_changes.len() <= dense.result.ledger_changes.len());
+
+    fn change_is_noop(c: &LedgerEntryChange) -> bool {
+        let ttl_extends = c
+            .ttl_change
+            .as_ref()
+            .map(|ttl| ttl.new_live_until_ledger > ttl.old_live_until_ledger)
+            .unwrap_or(false);
+        c.encoded_new_value.is_none() && !ttl_extends
+    }
 
     let mut saw_cached_ttl_entry = false;
-    for (dense_change, apply_change) in dense
-        .result
-        .ledger_changes
-        .iter()
-        .zip(apply.result.ledger_changes.iter())
-    {
+    let mut saw_filtered_noop = false;
+    let mut apply_iter = apply.result.ledger_changes.iter();
+    let mut current_apply = apply_iter.next();
+    for dense_change in dense.result.ledger_changes.iter() {
         assert!(!dense_change.encoded_key.is_empty());
+
+        if dense_change
+            .ttl_change
+            .as_ref()
+            .map(|ttl| ttl.old_live_until_ledger == ledger_info.sequence_number + 1000)
+            .unwrap_or(false)
+        {
+            saw_cached_ttl_entry = true;
+        }
+
+        if change_is_noop(dense_change) {
+            // Apply path drops this entry entirely.
+            saw_filtered_noop = true;
+            continue;
+        }
+
+        let apply_change = current_apply
+            .expect("apply result missing a non-noop entry that exists in dense result");
+        current_apply = apply_iter.next();
+
         assert!(apply_change.encoded_key.is_empty());
         assert_eq!(dense_change.read_only, apply_change.read_only);
         assert_eq!(
@@ -1331,17 +1360,14 @@ fn test_apply_invoke_preserves_budget_while_omitting_encoded_keys() {
             apply_change.encoded_new_value
         );
         assert_eq!(dense_change.ttl_change, apply_change.ttl_change);
-
-        if dense_change
-            .ttl_change
-            .as_ref()
-            .map(|ttl| ttl.old_live_until_ledger == ledger_info.sequence_number + 1000)
-            .unwrap_or(false)
-        {
-            saw_cached_ttl_entry = true;
-        }
     }
+    assert!(current_apply.is_none(), "apply path produced extra entries");
     assert!(saw_cached_ttl_entry);
+    assert!(
+        saw_filtered_noop,
+        "expected the test scenario to exercise the sparse apply-mode filter \
+         (at least one no-op read-only footprint entry should have been dropped)"
+    );
 }
 
 #[test]

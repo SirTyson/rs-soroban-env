@@ -229,12 +229,30 @@ fn get_ledger_changes(
     init_entry_metadata: Option<&[Option<InitialEntryMetadata>]>,
     min_live_until_ledger: u32,
     restored_keys: &Option<RestoredKeySet>,
-    populate_encoded_key: bool,
+    apply_mode: bool,
     #[cfg(any(test, feature = "recording_mode"))] current_ledger_seq: u32,
 ) -> Result<Vec<LedgerEntryChange>, HostError> {
     // Skip allocation metering for this for the sake of simplicity - the
     // bounding factor here is XDR decoding which is metered.
-    let mut changes = Vec::with_capacity(storage.map.len());
+    //
+    // In `apply_mode` the downstream consumers (the stellar-core bridge's
+    // `extract_rent_changes` and `extract_ledger_effects`) only ever look at
+    // entries with either `encoded_new_value.is_some()` or a TTL extension
+    // (`ttl_change.new_live_until_ledger > ttl_change.old_live_until_ledger`).
+    // All other entries (most read-only footprint entries on a successful
+    // soroswap swap) contribute nothing downstream, so we omit them from the
+    // result vector entirely. Budget accounting is preserved because every
+    // metered call (`metered_write_xdr` for the key, `sha256_hash_from_bytes`
+    // for non-cached TTL hashes, `metered_write_xdr` for old/new entries when
+    // applicable, `entry_size_for_rent` for ContractCode wasm memory cost) is
+    // still performed for every footprint entry; only the resulting struct
+    // allocation, vector push, and the two downstream filter passes are
+    // skipped for entries that would have been no-ops.
+    let mut changes = if apply_mode {
+        Vec::new()
+    } else {
+        Vec::with_capacity(storage.map.len())
+    };
 
     let footprint_map = &storage.footprint.0;
     // We return any invariant errors here as internal errors, as they would
@@ -257,22 +275,23 @@ fn get_ledger_changes(
         // Keep budget accounting identical to the dense path by performing the
         // metered key serialization for every footprint entry. The apply path
         // writes into a reused scratch buffer instead of retaining the bytes in
-        // each LedgerEntryChange.
-        if populate_encoded_key {
-            metered_write_xdr(budget, key.as_ref(), &mut entry_change.encoded_key)?;
-        } else {
+        // each LedgerEntryChange (the stellar-core bridge never consumes
+        // `encoded_key`).
+        if apply_mode {
             scratch_key_buf.clear();
             metered_write_xdr(budget, key.as_ref(), &mut scratch_key_buf)?;
+        } else {
+            metered_write_xdr(budget, key.as_ref(), &mut entry_change.encoded_key)?;
         }
 
         if let Some(durability) = durability {
             let key_hash = match initial_metadata.and_then(|metadata| metadata.ttl_entry.as_ref()) {
                 Some(ttl_entry) => ttl_entry.key_hash.0.to_vec(),
                 None => {
-                    let key_bytes = if populate_encoded_key {
-                        entry_change.encoded_key.as_slice()
-                    } else {
+                    let key_bytes = if apply_mode {
                         scratch_key_buf.as_slice()
+                    } else {
+                        entry_change.encoded_key.as_slice()
                     };
                     sha256_hash_from_bytes(key_bytes, budget)?
                 }
@@ -368,6 +387,29 @@ fn get_ledger_changes(
             }
             None => {
                 return Err(internal_error());
+            }
+        }
+        if apply_mode {
+            // Pre-filter: only retain entries that downstream extractors
+            // (`extract_rent_changes` / `extract_ledger_effects`) actually
+            // consume. The exhaustive predicate is:
+            //   * `encoded_new_value.is_some()` — produces a modified-entry
+            //     buffer and, when paired with `ttl_change`, potentially a
+            //     rent change due to size growth.
+            //   * `ttl_change` Some AND `new_live_until_ledger >
+            //     old_live_until_ledger` — produces a TTL ledger entry and a
+            //     rent change.
+            // Entries failing both conditions (e.g. unmodified read-only
+            // contract instance / code / data footprint members on a
+            // successful invocation) contribute nothing and are dropped.
+            let keep = entry_change.encoded_new_value.is_some()
+                || entry_change
+                    .ttl_change
+                    .as_ref()
+                    .map(|ttl| ttl.new_live_until_ledger > ttl.old_live_until_ledger)
+                    .unwrap_or(false);
+            if !keep {
+                continue;
             }
         }
         changes.push(entry_change);
@@ -519,16 +561,27 @@ pub fn invoke_host_function<T: AsRef<[u8]>, I: ExactSizeIterator<Item = T>>(
         diagnostic_events,
         trace_hook,
         module_cache,
-        /* populate_ledger_change_encoded_keys */ true,
+        /* apply_mode */ false,
     )
 }
 
-/// Same as [`invoke_host_function`] but omits the per-entry `encoded_key`
-/// bytes in the returned `LedgerEntryChange`s. Use this when the caller
-/// does not consume `encoded_key` (e.g. the stellar-core bridge apply
-/// path, which extracts only `read_only`, `encoded_new_value`, and
-/// `ttl_change`). Budget accounting is preserved by still performing the
-/// metered key serialization into a reused scratch buffer.
+/// Same as [`invoke_host_function`] but uses the sparse apply-mode result
+/// shape: per-entry `encoded_key` bytes are omitted from the returned
+/// `LedgerEntryChange`s, and no-op entries (read-only footprint entries
+/// that produce neither a modified `encoded_new_value` nor a TTL
+/// extension) are dropped from the result vector entirely. Use this when
+/// the caller does not consume `encoded_key` and only cares about
+/// rent-relevant and modified-entry changes (e.g. the stellar-core
+/// bridge apply path, which feeds the result through
+/// `extract_rent_changes` and `extract_ledger_effects`).
+///
+/// Budget accounting is preserved bit-for-bit: every metered call that
+/// the dense path performs (`metered_write_xdr` for keys / old / new
+/// entries, `sha256_hash_from_bytes` for non-cached TTL hashes,
+/// `wasm_module_memory_cost` via `entry_size_for_rent`) is still
+/// executed for every footprint entry. Only the resulting struct
+/// allocation, vector push, and downstream filter passes are skipped for
+/// the no-op entries.
 #[allow(clippy::too_many_arguments)]
 pub fn invoke_host_function_for_apply<T: AsRef<[u8]>, I: ExactSizeIterator<Item = T>>(
     budget: &Budget,
@@ -561,7 +614,7 @@ pub fn invoke_host_function_for_apply<T: AsRef<[u8]>, I: ExactSizeIterator<Item 
         diagnostic_events,
         trace_hook,
         module_cache,
-        /* populate_ledger_change_encoded_keys */ false,
+        /* apply_mode */ true,
     )
 }
 
@@ -581,7 +634,7 @@ fn invoke_host_function_internal<T: AsRef<[u8]>, I: ExactSizeIterator<Item = T>>
     diagnostic_events: &mut Vec<DiagnosticEvent>,
     trace_hook: Option<TraceHook>,
     module_cache: Option<ModuleCache>,
-    populate_ledger_change_encoded_keys: bool,
+    apply_mode: bool,
 ) -> Result<InvokeHostFunctionResult, HostError> {
     let _span0 = tracy_span!("invoke_host_function");
 
@@ -672,7 +725,7 @@ fn invoke_host_function_internal<T: AsRef<[u8]>, I: ExactSizeIterator<Item = T>>
             Some(&init_entry_metadata),
             min_live_until_ledger,
             &restored_keys,
-            populate_ledger_change_encoded_keys,
+            apply_mode,
             #[cfg(any(test, feature = "recording_mode"))]
             current_ledger_seq,
         )?;
@@ -1003,7 +1056,7 @@ pub fn invoke_host_function_in_recording_mode(
             Some(&init_entry_metadata),
             min_live_until_ledger,
             &restored_keys,
-            true,
+            /* apply_mode */ false,
             ledger_seq,
         )?;
         // Add the keys that only exist in the footprint, but not in the
