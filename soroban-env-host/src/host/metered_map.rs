@@ -316,10 +316,12 @@ where
 
     // PoC H002: side-index-aware fast path for storage / footprint maps.
     //
-    // `get_at_known_position` returns the value at `pos` and charges the same
-    // `charge_binsearch` + `charge_access(1)` budget that a successful
+    // `get_at_known_position` returns the value at `pos` and normally charges
+    // the same `charge_binsearch` + `charge_access(1)` budget that a successful
     // `get` lookup would charge, but skips the binary search itself and the
-    // per-comparison MemCmp charges. Intended only for callers that have
+    // per-comparison MemCmp charges. In the next-protocol coalesced metering
+    // mode this physical bookkeeping charge is omitted, matching the broader
+    // next-protocol host-metering model. Intended only for callers that have
     // independently verified the key matches at `pos` via a side index built
     // from the same key set.
     pub(crate) fn get_at_known_position(
@@ -327,11 +329,20 @@ where
         pos: usize,
         ctx: &Ctx,
     ) -> Result<Option<&V>, HostError> {
-        let _span = tracy_span!("map lookup indexed");
-        self.charge_binsearch(ctx)?;
+        let coalesced_host_metering = ctx.as_budget().coalesced_host_metering()?;
+        let _span = if coalesced_host_metering {
+            None
+        } else {
+            Some(tracy_span!("map lookup indexed"))
+        };
+        if !coalesced_host_metering {
+            self.charge_binsearch(ctx)?;
+        }
         match self.map.get(pos) {
             Some((_, v)) => {
-                self.charge_access(1, ctx)?;
+                if !coalesced_host_metering {
+                    self.charge_access(1, ctx)?;
+                }
                 Ok(Some(v))
             }
             None => Ok(None),
@@ -342,9 +353,15 @@ where
     // Used by indexed fast paths when the side index has already determined
     // that a key is missing, to keep the budget consistent with a real
     // `find` that returned `Err(insertion_pos)` and fell through to a
-    // `Ok(None)` / error result without charging access.
+    // `Ok(None)` / error result without charging access. In next-protocol
+    // coalesced host-metering mode the indexed lookup bookkeeping charge is
+    // intentionally omitted.
     pub(crate) fn charge_lookup<B: AsBudget>(&self, b: &B) -> Result<(), HostError> {
-        self.charge_binsearch(b)
+        if b.as_budget().coalesced_host_metering()? {
+            Ok(())
+        } else {
+            self.charge_binsearch(b)
+        }
     }
 
     // PoC H002: indexed-fast-path replacement insert. Mirrors `insert`'s
