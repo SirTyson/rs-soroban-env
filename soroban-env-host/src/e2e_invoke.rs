@@ -475,6 +475,7 @@ static E2E_PROF_NS: [std::sync::atomic::AtomicU64; 6] = [
 static E2E_PROF_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static E2E_CACHE_HIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static E2E_CACHE_MISS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static E2E_METER_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 impl E2eProf {
     fn enabled() -> bool {
         *E2E_PROF_ENABLED.get_or_init(|| std::env::var_os("SOROBAN_E2E_PROFILE").is_some())
@@ -487,10 +488,11 @@ impl E2eProf {
         if n % 50_000 == 0 {
             let names = ["parse", "clone", "setup", "exec", "finish", "encode"];
             let mut line = format!(
-                "E2E_PROFILE n={} hit={} miss={}",
+                "E2E_PROFILE n={} hit={} miss={} meter={}",
                 n,
                 E2E_CACHE_HIT.load(std::sync::atomic::Ordering::Relaxed),
-                E2E_CACHE_MISS.load(std::sync::atomic::Ordering::Relaxed)
+                E2E_CACHE_MISS.load(std::sync::atomic::Ordering::Relaxed),
+                E2E_METER_COUNT.load(std::sync::atomic::Ordering::Relaxed)
             );
             for (i, nm) in names.iter().enumerate() {
                 let ms = E2E_PROF_NS[i].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1.0e6;
@@ -642,6 +644,9 @@ pub fn invoke_host_function<T: AsRef<[u8]>, I: ExactSizeIterator<Item = T>>(
     };
     lap_ns(5);
     if prof {
+        if let Ok(mc) = budget.get_meter_count() {
+            E2E_METER_COUNT.fetch_add(mc as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         E2eProf::bump_and_maybe_report();
     }
     ret

@@ -1409,6 +1409,10 @@ impl Budget {
             .track_time(ty, duration)
     }
 
+    pub fn get_meter_count(&self) -> Result<u32, HostError> {
+        Ok(self.0.try_borrow_or_err()?.tracker.meter_count)
+    }
+
     pub fn get_cpu_insns_consumed(&self) -> Result<u64, HostError> {
         Ok(self.0.try_borrow_or_err()?.cpu_insns.get_total_count())
     }
