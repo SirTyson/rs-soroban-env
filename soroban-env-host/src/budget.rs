@@ -1496,3 +1496,117 @@ fn test_budget_initialization() -> Result<(), HostError> {
 
     Ok(())
 }
+
+
+/// A snapshot of the budget's per-type cost trackers and dimension totals,
+/// used together with [`Budget::capture_charges_since`] to record the exact
+/// accounting effect of a metered computation.
+pub struct BudgetSnapshot {
+    cost_trackers: Vec<CostTracker>,
+    meter_count: u32,
+    cpu: u64,
+    mem: u64,
+}
+
+/// The recorded accounting effect of a metered computation: per-cost-type
+/// tracker deltas plus total cpu/mem dimension consumption. Applying this via
+/// [`Budget::apply_recorded_charges`] advances the budget bit-identically to
+/// re-running the original sequence of `charge` calls (in particular it
+/// preserves the per-call cost-model rounding), without redoing the work.
+#[derive(Clone, Default)]
+pub struct RecordedCharges {
+    deltas: Vec<(usize, CostTracker)>,
+    meter_count: u32,
+    cpu: u64,
+    mem: u64,
+}
+
+impl Budget {
+    /// Snapshots tracker and dimension state ahead of a metered computation
+    /// whose charges the caller intends to record. Only valid in enforcing
+    /// (non-shadow) mode.
+    pub fn snapshot_for_recording(&self) -> Result<BudgetSnapshot, HostError> {
+        let b = self.0.try_borrow_or_err()?;
+        Ok(BudgetSnapshot {
+            cost_trackers: b.tracker.cost_trackers.to_vec(),
+            meter_count: b.tracker.meter_count,
+            cpu: b.cpu_insns.get_total_count(),
+            mem: b.mem_bytes.get_total_count(),
+        })
+    }
+
+    /// Captures the difference between the current budget state and the
+    /// given snapshot as a replayable [`RecordedCharges`].
+    pub fn capture_charges_since(
+        &self,
+        before: &BudgetSnapshot,
+    ) -> Result<RecordedCharges, HostError> {
+        let b = self.0.try_borrow_or_err()?;
+        let mut deltas = Vec::new();
+        for (i, tr) in b.tracker.cost_trackers.iter().enumerate() {
+            let prev = &before.cost_trackers[i];
+            if tr.iterations != prev.iterations
+                || tr.inputs != prev.inputs
+                || tr.cpu != prev.cpu
+                || tr.mem != prev.mem
+            {
+                deltas.push((
+                    i,
+                    CostTracker {
+                        iterations: tr.iterations.saturating_sub(prev.iterations),
+                        inputs: match (tr.inputs, prev.inputs) {
+                            (Some(a), Some(b)) => Some(a.saturating_sub(b)),
+                            (a, None) => a,
+                            _ => None,
+                        },
+                        cpu: tr.cpu.saturating_sub(prev.cpu),
+                        mem: tr.mem.saturating_sub(prev.mem),
+                    },
+                ));
+            }
+        }
+        Ok(RecordedCharges {
+            deltas,
+            meter_count: b.tracker.meter_count.saturating_sub(before.meter_count),
+            cpu: b.cpu_insns.get_total_count().saturating_sub(before.cpu),
+            mem: b.mem_bytes.get_total_count().saturating_sub(before.mem),
+        })
+    }
+
+    /// Returns true iff applying `rc` is guaranteed not to exceed either
+    /// budget limit (callers should fall back to the real computation
+    /// otherwise, to reproduce exact partial-charge failure semantics).
+    pub fn fits_recorded_charges(&self, rc: &RecordedCharges) -> Result<bool, HostError> {
+        let b = self.0.try_borrow_or_err()?;
+        Ok(b.cpu_insns.get_remaining() >= rc.cpu && b.mem_bytes.get_remaining() >= rc.mem)
+    }
+
+    /// Applies previously recorded charges: advances the per-type trackers
+    /// and the cpu/mem dimension totals by the recorded amounts and runs the
+    /// limit checks. Must only be used in enforcing (non-shadow) mode with a
+    /// recording captured under the same cost parameters.
+    pub fn apply_recorded_charges(&self, rc: &RecordedCharges) -> Result<(), HostError> {
+        let mut b = self.0.try_borrow_mut_or_err()?;
+        if b.is_in_shadow_mode {
+            return Err((ScErrorType::Budget, ScErrorCode::InternalError).into());
+        }
+        for (i, d) in rc.deltas.iter() {
+            let tr = b
+                .tracker
+                .cost_trackers
+                .get_mut(*i)
+                .ok_or_else(|| HostError::from((ScErrorType::Budget, ScErrorCode::InternalError)))?;
+            tr.iterations = tr.iterations.saturating_add(d.iterations);
+            if let (Some(t), Some(di)) = (&mut tr.inputs, d.inputs) {
+                *t = t.saturating_add(di);
+            }
+            tr.cpu = tr.cpu.saturating_add(d.cpu);
+            tr.mem = tr.mem.saturating_add(d.mem);
+        }
+        b.tracker.meter_count = b.tracker.meter_count.saturating_add(rc.meter_count);
+        b.cpu_insns.add_total_count(rc.cpu);
+        b.mem_bytes.add_total_count(rc.mem);
+        b.cpu_insns.check_budget_limit(IsShadowMode(false))?;
+        b.mem_bytes.check_budget_limit(IsShadowMode(false))
+    }
+}

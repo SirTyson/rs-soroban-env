@@ -125,6 +125,10 @@ impl BudgetDimension {
         self.total_count
     }
 
+    pub(crate) fn add_total_count(&mut self, amount: u64) {
+        self.total_count = self.total_count.saturating_add(amount);
+    }
+
     pub(crate) fn get_remaining(&self) -> u64 {
         self.limit.saturating_sub(self.total_count)
     }

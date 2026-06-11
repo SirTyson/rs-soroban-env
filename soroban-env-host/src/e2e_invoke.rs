@@ -457,6 +457,50 @@ pub fn entry_size_for_rent(
 /// When diagnostics are enabled, we try to populate `diagnostic_events`
 /// even if the `InvokeHostFunctionResult` fails for any reason.
 #[allow(clippy::too_many_arguments)]
+
+// Lightweight, opt-in phase profiling for invoke_host_function: set
+// SOROBAN_E2E_PROFILE=1 to accumulate per-phase nanosecond totals across all
+// invocations (and threads) and print a summary line to stderr every 50k
+// invocations. Costs two atomics per phase when enabled, nothing when not.
+struct E2eProf;
+static E2E_PROF_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static E2E_PROF_NS: [std::sync::atomic::AtomicU64; 6] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+static E2E_PROF_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static E2E_CACHE_HIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static E2E_CACHE_MISS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+impl E2eProf {
+    fn enabled() -> bool {
+        *E2E_PROF_ENABLED.get_or_init(|| std::env::var_os("SOROBAN_E2E_PROFILE").is_some())
+    }
+    fn add(phase: usize, ns: u64) {
+        E2E_PROF_NS[phase].fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn bump_and_maybe_report() {
+        let n = E2E_PROF_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n % 50_000 == 0 {
+            let names = ["parse", "clone", "setup", "exec", "finish", "encode"];
+            let mut line = format!(
+                "E2E_PROFILE n={} hit={} miss={}",
+                n,
+                E2E_CACHE_HIT.load(std::sync::atomic::Ordering::Relaxed),
+                E2E_CACHE_MISS.load(std::sync::atomic::Ordering::Relaxed)
+            );
+            for (i, nm) in names.iter().enumerate() {
+                let ms = E2E_PROF_NS[i].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1.0e6;
+                line.push_str(&format!(" {}={:.1}ms", nm, ms));
+            }
+            eprintln!("{}", line);
+        }
+    }
+}
+
 pub fn invoke_host_function<T: AsRef<[u8]>, I: ExactSizeIterator<Item = T>>(
     budget: &Budget,
     enable_diagnostics: bool,
@@ -479,6 +523,15 @@ pub fn invoke_host_function<T: AsRef<[u8]>, I: ExactSizeIterator<Item = T>>(
     module_cache: &mut Option<ModuleCache>,
 ) -> Result<InvokeHostFunctionResult, HostError> {
     let _span0 = tracy_span!("invoke_host_function");
+    let prof = E2eProf::enabled();
+    let mut lap = std::time::Instant::now();
+    let mut lap_ns = |phase: usize| {
+        if prof {
+            let now = std::time::Instant::now();
+            E2eProf::add(phase, now.duration_since(lap).as_nanos() as u64);
+            lap = now;
+        }
+    };
 
     let resources: SorobanResources =
         metered_from_xdr_with_budget(encoded_resources.as_ref(), &budget)?;
@@ -503,7 +556,9 @@ pub fn invoke_host_function<T: AsRef<[u8]>, I: ExactSizeIterator<Item = T>>(
         false,
     )?;
 
+    lap_ns(0);
     let init_storage_map = storage_map.metered_clone(budget)?;
+    lap_ns(1);
 
     let storage = Storage::with_enforcing_footprint_and_map(footprint, storage_map);
     let host = Host::with_storage_and_budget(storage, budget.clone());
@@ -532,10 +587,12 @@ pub fn invoke_host_function<T: AsRef<[u8]>, I: ExactSizeIterator<Item = T>>(
     if let Some(module_cache) = module_cache.take() {
         host.set_module_cache(module_cache)?;
     }
+    lap_ns(2);
     let result = {
         let _span1 = tracy_span!("Host::invoke_function");
         host.invoke_function(host_function)
     };
+    lap_ns(3);
     // Move the (shared) module-cache handle back out to the caller's slot so it
     // can be reused on the next invocation without re-cloning its `Arc`s. The
     // host only ever reads its module cache during the invocation (it never
@@ -547,6 +604,7 @@ pub fn invoke_host_function<T: AsRef<[u8]>, I: ExactSizeIterator<Item = T>>(
         host.set_trace_hook(None)?;
     }
     let (storage, events) = host.try_finish()?;
+    lap_ns(4);
     if enable_diagnostics {
         extract_diagnostic_events(&events, diagnostic_events);
     }
@@ -554,7 +612,7 @@ pub fn invoke_host_function<T: AsRef<[u8]>, I: ExactSizeIterator<Item = T>>(
         let mut encoded_result_sc_val = take_output_buffer();
         metered_write_xdr(&budget, &res, &mut encoded_result_sc_val).map(|_| encoded_result_sc_val)
     });
-    if encoded_invoke_result.is_ok() {
+    let ret = if encoded_invoke_result.is_ok() {
         let init_storage_snapshot = StorageMapSnapshotSource {
             budget: &budget,
             map: &init_storage_map,
@@ -581,7 +639,12 @@ pub fn invoke_host_function<T: AsRef<[u8]>, I: ExactSizeIterator<Item = T>>(
             ledger_changes: vec![],
             encoded_contract_events: vec![],
         })
+    };
+    lap_ns(5);
+    if prof {
+        E2eProf::bump_and_maybe_report();
     }
+    ret
 }
 
 #[cfg(any(test, feature = "recording_mode"))]
@@ -1020,6 +1083,82 @@ fn build_storage_footprint_from_xdr(
     Ok(Footprint(footprint_map))
 }
 
+
+// Content-addressed cache of parsed ledger entries, shared across
+// invocations on the same thread. Footprint entries are re-sent (as XDR
+// buffers) and re-parsed for every invocation, but hot read-only entries
+// (e.g. a token contract instance invoked by every tx in a cluster) are
+// byte-identical across invocations. On a hit we reuse the previously
+// parsed entry/key Rcs and apply the recorded budget charges of the
+// original parse via Budget::apply_recorded_charges, which advances the
+// budget bit-identically to re-parsing (see RecordedCharges); near the
+// budget limit we fall back to the real parse so partial-charge failure
+// semantics are preserved. Only active in enforcing (non-shadow) mode.
+struct ParsedEntryCacheItem {
+    bytes: Vec<u8>,
+    le: Rc<LedgerEntry>,
+    key: Rc<LedgerKey>,
+    charges: Rc<crate::budget::RecordedCharges>,
+}
+thread_local! {
+    static PARSED_ENTRY_CACHE: std::cell::RefCell<
+        std::collections::HashMap<u64, Vec<ParsedEntryCacheItem>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn parse_ledger_entry_with_key_cached(
+    budget: &Budget,
+    buf: &[u8],
+) -> Result<(Rc<LedgerEntry>, Rc<LedgerKey>), HostError> {
+    let parse = |budget: &Budget| -> Result<(Rc<LedgerEntry>, Rc<LedgerKey>), HostError> {
+        let le = Rc::metered_new(
+            metered_from_xdr_with_budget::<LedgerEntry>(buf, budget)?,
+            budget,
+        )?;
+        let key = Rc::metered_new(ledger_entry_to_ledger_key(&le, budget)?, budget)?;
+        Ok((le, key))
+    };
+    if budget.is_in_shadow_mode()? {
+        return parse(budget);
+    }
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    buf.hash(&mut h);
+    let hv = h.finish();
+    let hit = PARSED_ENTRY_CACHE.with(|c| {
+        c.borrow().get(&hv).and_then(|v| {
+            v.iter()
+                .find(|it| it.bytes.as_slice() == buf)
+                .map(|it| (it.le.clone(), it.key.clone(), it.charges.clone()))
+        })
+    });
+    if let Some((le, key, charges)) = hit {
+        if budget.fits_recorded_charges(&charges)? {
+            budget.apply_recorded_charges(&charges)?;
+            E2E_CACHE_HIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok((le, key));
+        }
+        return parse(budget);
+    }
+    E2E_CACHE_MISS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let snap = budget.snapshot_for_recording()?;
+    let (le, key) = parse(budget)?;
+    let charges = Rc::new(budget.capture_charges_since(&snap)?);
+    PARSED_ENTRY_CACHE.with(|c| {
+        let mut m = c.borrow_mut();
+        if m.len() > 16384 {
+            m.clear();
+        }
+        m.entry(hv).or_default().push(ParsedEntryCacheItem {
+            bytes: buf.to_vec(),
+            le: le.clone(),
+            key: key.clone(),
+            charges,
+        });
+    });
+    Ok((le, key))
+}
+
 fn build_storage_map_from_xdr_ledger_entries<T: AsRef<[u8]>, I: ExactSizeIterator<Item = T>>(
     budget: &Budget,
     footprint: &Footprint,
@@ -1040,11 +1179,7 @@ fn build_storage_map_from_xdr_ledger_entries<T: AsRef<[u8]>, I: ExactSizeIterato
     for (entry_buf, ttl_buf) in encoded_ledger_entries.zip(encoded_ttl_entries) {
         let mut live_until_ledger: Option<u32> = None;
 
-        let le = Rc::metered_new(
-            metered_from_xdr_with_budget::<LedgerEntry>(entry_buf.as_ref(), budget)?,
-            budget,
-        )?;
-        let key = Rc::metered_new(ledger_entry_to_ledger_key(&le, budget)?, budget)?;
+        let (le, key) = parse_ledger_entry_with_key_cached(budget, entry_buf.as_ref())?;
         if !ttl_buf.as_ref().is_empty() {
             let ttl_entry = Rc::metered_new(
                 metered_from_xdr_with_budget::<TtlEntry>(ttl_buf.as_ref(), budget)?,
