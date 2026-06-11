@@ -232,6 +232,69 @@ fn saturating_u64_to_u32(value: u64) -> u32 {
 /// Returns the difference between the `storage` and its initial snapshot as
 /// `LedgerEntryChanges`.
 /// Returns an entry for every item in `storage` footprint.
+
+// Content-addressed cache of the per-key work at the head of the
+// get_ledger_changes loop: the XDR-encoded key bytes and (when the key has
+// no TTL entry) the SHA256 key hash, together with the recorded budget
+// charges of computing them. Ledger keys repeat across invocations and
+// ledgers (the same accounts/contract entries are touched over and over),
+// so on a hit we reuse the bytes and apply identical charges. See
+// PARSED_ENTRY_CACHE for the overall pattern.
+struct EncodedKeyCacheItem {
+    key: Rc<LedgerKey>,
+    encoded: Vec<u8>,
+    charges: Rc<crate::budget::RecordedCharges>,
+}
+thread_local! {
+    static ENCODED_KEY_CACHE: std::cell::RefCell<
+        std::collections::HashMap<u64, Vec<EncodedKeyCacheItem>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn encode_key_cached(
+    budget: &Budget,
+    key: &Rc<LedgerKey>,
+    out: &mut Vec<u8>,
+) -> Result<(), HostError> {
+    if budget.is_in_shadow_mode()? {
+        return metered_write_xdr(budget, key.as_ref(), out);
+    }
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut h);
+    let hv = h.finish();
+    let hit = ENCODED_KEY_CACHE.with(|c| {
+        c.borrow().get(&hv).and_then(|v| {
+            v.iter()
+                .find(|it| it.key.as_ref() == key.as_ref())
+                .map(|it| (it.encoded.clone(), it.charges.clone()))
+        })
+    });
+    if let Some((encoded, charges)) = hit {
+        if budget.fits_recorded_charges(&charges)? {
+            budget.apply_recorded_charges(&charges)?;
+            out.extend_from_slice(&encoded);
+            return Ok(());
+        }
+        return metered_write_xdr(budget, key.as_ref(), out);
+    }
+    let snap = budget.snapshot_for_recording()?;
+    metered_write_xdr(budget, key.as_ref(), out)?;
+    let charges = Rc::new(budget.capture_charges_since(&snap)?);
+    ENCODED_KEY_CACHE.with(|c| {
+        let mut m = c.borrow_mut();
+        if m.len() > 16384 {
+            m.clear();
+        }
+        m.entry(hv).or_default().push(EncodedKeyCacheItem {
+            key: key.clone(),
+            encoded: out.clone(),
+            charges,
+        });
+    });
+    Ok(())
+}
+
 fn get_ledger_changes(
     budget: &Budget,
     storage: &Storage,
@@ -257,7 +320,7 @@ fn get_ledger_changes(
     };
     for (key, entry_with_live_until_ledger) in storage.map.iter(budget)? {
         let mut entry_change = LedgerEntryChange::default();
-        metered_write_xdr(budget, key.as_ref(), &mut entry_change.encoded_key)?;
+        encode_key_cached(budget, key, &mut entry_change.encoded_key)?;
         let durability = get_key_durability(key);
 
         if let Some(durability) = durability {
