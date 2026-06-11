@@ -7,6 +7,7 @@ mod wasmi_helper;
 pub(crate) use limits::DepthLimiter;
 pub use limits::{DEFAULT_HOST_DEPTH_LIMIT, DEFAULT_XDR_RW_LIMITS};
 pub use model::{MeteredCostComponent, ScaledU64};
+use model::HostCostModel as _;
 pub(crate) use wasmi_helper::{get_wasmi_config, load_calibrated_fuel_costs};
 
 use std::{
@@ -238,14 +239,21 @@ impl BudgetImpl {
         iterations: u64,
         input: Option<u64>,
     ) -> Result<(), HostError> {
-        let tracker = self
-            .tracker
-            .cost_trackers
-            .get_mut(ty as usize)
-            .ok_or_else(|| HostError::from((ScErrorType::Budget, ScErrorCode::InternalError)))?;
-
+        // Fast path for the common case (enforcing mode): one pass over both
+        // dimensions with inlined model evaluation. The arithmetic (including
+        // per-call rounding in `evaluate`) and the failure points are
+        // identical to the general path below; this exists purely because
+        // `charge` is called hundreds of times per host invocation and
+        // dominates invocation time for small transactions.
         if !self.is_in_shadow_mode {
-            // update tracker for reporting
+            let idx = ty as usize;
+            let tracker = self
+                .tracker
+                .cost_trackers
+                .get_mut(idx)
+                .ok_or_else(|| {
+                    HostError::from((ScErrorType::Budget, ScErrorCode::InternalError))
+                })?;
             self.tracker.meter_count = self.tracker.meter_count.saturating_add(1);
             tracker.iterations = tracker.iterations.saturating_add(iterations);
             match (&mut tracker.inputs, input) {
@@ -254,6 +262,37 @@ impl BudgetImpl {
                 // internal logic error, a wrong cost type has been passed in
                 _ => return Err((ScErrorType::Budget, ScErrorCode::InternalError).into()),
             };
+
+            let cpu_charged = self
+                .cpu_insns
+                .cost_models
+                .get(idx)
+                .ok_or_else(|| {
+                    HostError::from((ScErrorType::Budget, ScErrorCode::InternalError))
+                })?
+                .evaluate(iterations, input)?;
+            tracker.cpu = tracker.cpu.saturating_add(cpu_charged);
+            self.cpu_insns.total_count =
+                self.cpu_insns.total_count.saturating_add(cpu_charged);
+            if self.cpu_insns.total_count > self.cpu_insns.limit {
+                return Err((ScErrorType::Budget, ScErrorCode::ExceededLimit).into());
+            }
+
+            let mem_charged = self
+                .mem_bytes
+                .cost_models
+                .get(idx)
+                .ok_or_else(|| {
+                    HostError::from((ScErrorType::Budget, ScErrorCode::InternalError))
+                })?
+                .evaluate(iterations, input)?;
+            tracker.mem = tracker.mem.saturating_add(mem_charged);
+            self.mem_bytes.total_count =
+                self.mem_bytes.total_count.saturating_add(mem_charged);
+            if self.mem_bytes.total_count > self.mem_bytes.limit {
+                return Err((ScErrorType::Budget, ScErrorCode::ExceededLimit).into());
+            }
+            return Ok(());
         }
 
         let cpu_charged = self.cpu_insns.charge(
@@ -263,12 +302,10 @@ impl BudgetImpl {
             IsCpu(true),
             IsShadowMode(self.is_in_shadow_mode),
         )?;
-        if !self.is_in_shadow_mode {
-            tracker.cpu = tracker.cpu.saturating_add(cpu_charged);
-        }
         self.cpu_insns
             .check_budget_limit(IsShadowMode(self.is_in_shadow_mode))?;
 
+        let _ = cpu_charged;
         let mem_charged = self.mem_bytes.charge(
             ty,
             iterations,
@@ -276,9 +313,7 @@ impl BudgetImpl {
             IsCpu(false),
             IsShadowMode(self.is_in_shadow_mode),
         )?;
-        if !self.is_in_shadow_mode {
-            tracker.mem = tracker.mem.saturating_add(mem_charged);
-        }
+        let _ = mem_charged;
         self.mem_bytes
             .check_budget_limit(IsShadowMode(self.is_in_shadow_mode))
     }
